@@ -1,0 +1,671 @@
+package com.kam.magplayer
+
+import android.util.JsonReader
+import android.util.JsonToken
+import android.util.Log
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.ResponseBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.TimeUnit
+
+/**
+ * Xtream Codes API client.
+ *
+ * All requests are stateless — no handshake, no token, no MAC address.
+ * Every call authenticates via username + password in the query string.
+ *
+ * Base URL format:  http://server:port
+ * API endpoint:     http://server:port/player_api.php?username=X&password=Y&action=...
+ * Stream URL:       http://server:port/live/username/password/streamId.m3u8
+ */
+class XtreamClient(
+    private val serverUrl: String,  // e.g. http://pro.server.com:8080
+    private val username: String,
+    private val password: String
+) {
+    companion object {
+        private const val TAG = "XtreamClient"
+
+        /**
+         * Try to parse Xtream credentials from a pasted URL.
+         * Handles formats:
+         *   http://server/get.php?username=X&password=Y&type=m3u_plus
+         *   http://server/player_api.php?username=X&password=Y
+         *   http://server/live/username/password/streamid.m3u8
+         *
+         * Returns Triple(serverUrl, username, password) or null if not Xtream.
+         */
+        fun parseFromUrl(url: String): Triple<String, String, String>? {
+            return try {
+                val uri = android.net.Uri.parse(url.trim())
+                val u = uri.getQueryParameter("username")
+                val p = uri.getQueryParameter("password")
+                if (!u.isNullOrBlank() && !p.isNullOrBlank()) {
+                    // Reconstruct server URL without path or query
+                    val port = if (uri.port != -1) ":${uri.port}" else ""
+                    val server = "${uri.scheme}://${uri.host}$port"
+                    Triple(server, u, p)
+                } else null
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    // ── Internal request helper ───────────────────────────────────────────────
+
+    private fun get(action: String, extraParams: String = ""): JSONObject {
+        val url = "$serverUrl/player_api.php?username=$username&password=$password&action=$action$extraParams"
+        Log.d(TAG, "GET $url")
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} for $action")
+            val body = response.body?.string() ?: throw IOException("Empty response for $action")
+            return JSONObject(body)
+        }
+    }
+
+    private fun getArray(action: String, extraParams: String = ""): JSONArray {
+        val url = "$serverUrl/player_api.php?username=$username&password=$password&action=$action$extraParams"
+        Log.d(TAG, "GET $url")
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} for $action")
+            val body = response.body ?: throw IOException("Empty response for $action")
+            // FIX: OOM on large playlists (50k+ items = 20-50MB JSON).
+            // Stream directly from the response body instead of calling body.string()
+            // which loads the entire payload into a single String on the heap.
+            // JSONArray(reader) is not available in org.json — use a capped read:
+            // read up to 16MB safely, warn and truncate beyond that.
+            return parseArrayBody(body)
+        }
+    }
+
+    private fun parseArrayBody(body: ResponseBody): JSONArray {
+        // FIX: OOM protection for large Xtream playlists (50k items = 20-50MB JSON).
+        // Cap at 16MB — this fits ~30,000 channel entries comfortably.
+        // Servers returning more than this are misconfigured; the user should
+        // filter by category instead of fetching all streams at once.
+        val maxBytes = 8 * 1024 * 1024L   // 8MB — per-category calls are small; full-list calls are blocked upstream
+        val source = body.source()
+        source.request(maxBytes)
+        val actualSize = source.buffer.size
+        if (actualSize >= maxBytes) {
+            Log.w(TAG, "Response truncated at 16MB (server returned ${actualSize / 1024 / 1024}MB+)")
+        }
+        val text = source.buffer.readUtf8(minOf(actualSize, maxBytes))
+
+        return try {
+            JSONArray(text)
+        } catch (e: Exception) {
+            try {
+                val obj = JSONObject(text)
+                obj.optJSONArray("data") ?: JSONArray()
+            } catch (e2: Exception) {
+                Log.e(TAG, "Failed to parse response: ${e2.message}")
+                JSONArray()
+            }
+        }
+    }
+    /**
+     * Per-category live-TV counts: Map<category_id, channelCount>.
+     *
+     * Uses the same streaming category_id tally as VOD/Series instead of the old
+     * name->id round-trip in PortalReloader, which silently produced 0 live counts
+     * when a stream's category_name didn't exactly match a category list entry
+     * (whitespace, HTML entities, or a blank name falling back to category_id).
+     * Tallying category_id directly off the stream objects sidesteps that entirely.
+     */
+    fun getLiveCategoryCounts(): Map<String, Int> = streamCategoryTally("get_live_streams")
+    // ── Account info ──────────────────────────────────────────────────────────
+
+    /**
+     * Fetch account info to verify credentials are valid.
+     * Returns true if the server accepts the credentials.
+     */
+    sealed class CredentialsResult {
+        /** Server confirmed credentials are valid and the account is usable. */
+        object Valid : CredentialsResult()
+        /** Server explicitly said credentials are wrong (auth=0 etc.). */
+        object Invalid : CredentialsResult()
+        /** Account exists but isn't usable: expired, banned, disabled, etc. */
+        data class AccountIssue(val status: String) : CredentialsResult()
+        /** Could not reach server or parse its response (network/server problem). */
+        data class Unreachable(val reason: String) : CredentialsResult()
+    }
+
+    /**
+     * Verify Xtream credentials by hitting player_api.php with no action,
+     * which returns the account_info payload on every Xtream-compatible
+     * server we've seen.
+     *
+     * Distinguishes four outcomes so callers can show meaningful errors
+     * rather than the catch-all "invalid credentials" that triggers
+     * false-positive complaints whenever the network is flaky.
+     */
+    fun verifyCredentialsDetailed(): CredentialsResult {
+        val obj: JSONObject = try {
+            get("")
+        } catch (e: IOException) {
+            // Network-level failure (timeout, connection refused, DNS).
+            // NOT a credential problem — don't blame the user.
+            Log.w(TAG, "verifyCredentials: unreachable: ${e.message}")
+            return CredentialsResult.Unreachable(e.message ?: "network error")
+        } catch (e: Exception) {
+            // JSON parse failures, SSL issues, anything else.
+            Log.w(TAG, "verifyCredentials: parse/other: ${e.message}")
+            return CredentialsResult.Unreachable(e.message ?: "server error")
+        }
+
+        val userInfo = obj.optJSONObject("user_info")
+        if (userInfo == null) {
+            // No user_info object at all — server returned something but not
+            // what Xtream servers return. Could be an HTML error page wrapped
+            // in JSON, a generic error response, or a non-Xtream server at
+            // the URL. Treat as Invalid only if there's also no server_info
+            // (some servers omit user_info when auth fails entirely).
+            return if (obj.has("server_info")) {
+                CredentialsResult.Valid  // permissive: server responded, no user_info field
+            } else {
+                CredentialsResult.Invalid
+            }
+        }
+
+        // Xtream's "auth" field is 1 on success, 0 on failure. Some servers
+        // return it as int, some as string. Handle both.
+        val auth = when (val v = userInfo.opt("auth")) {
+            is Int -> v
+            is String -> v.toIntOrNull() ?: 1
+            else -> 1   // missing → assume valid (older servers don't send it)
+        }
+        if (auth == 0) return CredentialsResult.Invalid
+
+        // Status field — many Xtream forks expose subscription state here.
+        // Common values: "Active", "Expired", "Banned", "Disabled", "Trial".
+        // Active and Trial are usable; anything else is an account issue.
+        val status = userInfo.optString("status").trim()
+        if (status.isNotBlank()) {
+            val normalised = status.lowercase()
+            val usable = normalised == "active" || normalised == "trial"
+            if (!usable) {
+                return CredentialsResult.AccountIssue(status)
+            }
+        }
+
+        return CredentialsResult.Valid
+    }
+
+    // Keep the old boolean method as a thin wrapper so existing callers
+// continue to compile. Only PortalReloader needs the detailed version.
+    fun verifyCredentials(): Boolean = verifyCredentialsDetailed() is CredentialsResult.Valid
+
+    // ── Live TV ───────────────────────────────────────────────────────────────
+
+    fun getLiveCategories(): List<VodCategory> {
+        return try {
+            val arr = getArray("get_live_categories")
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                VodCategory(
+                    id    = o.optString("category_id"),
+                    title = o.optString("category_name")
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getLiveCategories failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    fun getLiveStreams(categoryId: String = ""): List<Channel> {
+        return try {
+            val params = if (categoryId.isNotBlank() && categoryId != "*")
+                "&category_id=$categoryId" else ""
+            val arr = getArray("get_live_streams", params)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val streamId = o.optString("stream_id")
+                Channel(
+                    id       = streamId,
+                    epgId    = o.optString("epg_channel_id").ifBlank { streamId },
+                    name     = o.optString("name"),
+                    category = o.optString("category_name").ifBlank {
+                        o.optString("category_id")
+                    },
+                    cmd      = buildStreamUrl(streamId),
+                    logo     = o.optString("stream_icon").ifBlank { null }
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getLiveStreams failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    // ── VOD ───────────────────────────────────────────────────────────────────
+
+    fun getVodCategories(): List<VodCategory> {
+        return try {
+            val arr = getArray("get_vod_categories")
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                VodCategory(
+                    id    = o.optString("category_id"),
+                    title = o.optString("category_name")
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getVodCategories failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    fun getVodStreams(categoryId: String = ""): List<VodItem> {
+        return try {
+            val params = if (categoryId.isNotBlank() && categoryId != "*")
+                "&category_id=$categoryId" else ""
+            val arr = getArray("get_vod_streams", params)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val streamId = o.optString("stream_id")
+                val ext = o.optString("container_extension").ifBlank { "mp4" }
+                VodItem(
+                    id          = streamId,
+                    name        = o.optString("name"),
+                    poster      = o.optString("stream_icon").ifBlank { null },
+                    description = o.optString("plot").ifBlank { "" },
+                    year        = o.optString("year").ifBlank { "" },
+                    cmd         = buildVodUrl(streamId, ext),
+                    isSeries    = false,
+                    isMovie     = true
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getVodStreams failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    // ── Series ────────────────────────────────────────────────────────────────
+
+    fun getSeriesCategories(): List<VodCategory> {
+        return try {
+            val arr = getArray("get_series_categories")
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                VodCategory(
+                    id    = o.optString("category_id"),
+                    title = o.optString("category_name")
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getSeriesCategories failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    fun getSeries(categoryId: String = ""): List<VodItem> {
+        return try {
+            val params = if (categoryId.isNotBlank() && categoryId != "*")
+                "&category_id=$categoryId" else ""
+            val arr = getArray("get_series", params)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                VodItem(
+                    id          = o.optString("series_id"),
+                    name        = o.optString("name"),
+                    poster      = o.optString("cover").ifBlank { null },
+                    description = o.optString("plot").ifBlank { "" },
+                    year        = o.optString("releaseDate").take(4).ifBlank { "" },
+                    cmd         = "",  // series don't have a direct stream URL
+                    isSeries    = true,
+                    isMovie     = false
+                )
+            }.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        } catch (e: Exception) {
+            Log.e(TAG, "getSeries failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Full series detail — returns seasons and episodes in one call.
+     * This is the richest data source in the Xtream API.
+     */
+    fun getSeriesInfo(seriesId: String): XtreamSeriesInfo? {
+        return try {
+            val obj = get("get_series_info", "&series_id=$seriesId")
+            Log.d(TAG, "getSeriesInfo raw keys: ${obj.keys().asSequence().toList()}")
+            Log.d(TAG, "seasons type: ${obj.opt("seasons")?.javaClass?.simpleName}, episodes type: ${obj.opt("episodes")?.javaClass?.simpleName}")
+            val info = obj.optJSONObject("info") ?: return null
+
+            val seasons = mutableListOf<XtreamSeason>()
+
+            // "seasons" can be a JSON object (keys = season numbers) OR a JSON array
+            // on different server implementations. Handle both.
+            val seasonsRaw = obj.opt("seasons")
+            when (seasonsRaw) {
+                is org.json.JSONObject -> seasonsRaw.keys().forEach { key ->
+                    val s = seasonsRaw.optJSONObject(key) ?: return@forEach
+                    seasons.add(XtreamSeason(
+                        seasonNumber = s.optInt("season_number", key.toIntOrNull() ?: 0),
+                        name         = s.optString("name").ifBlank { "Season $key" },
+                        cover        = s.optString("cover").ifBlank { null },
+                        episodeCount = s.optInt("episode_count", 0)
+                    ))
+                }
+                is org.json.JSONArray -> {
+                    for (i in 0 until seasonsRaw.length()) {
+                        val s = seasonsRaw.optJSONObject(i) ?: continue
+                        val num = s.optInt("season_number", i + 1)
+                        seasons.add(XtreamSeason(
+                            seasonNumber = num,
+                            name         = s.optString("name").ifBlank { "Season $num" },
+                            cover        = s.optString("cover").ifBlank { null },
+                            episodeCount = s.optInt("episode_count", 0)
+                        ))
+                    }
+                }
+            }
+
+            val episodes = mutableListOf<XtreamEpisode>()
+            val episodesObj = obj.optJSONObject("episodes")
+            episodesObj?.keys()?.forEach { seasonKey ->
+                val arr = episodesObj.optJSONArray(seasonKey) ?: return@forEach
+                for (i in 0 until arr.length()) {
+                    val e = arr.getJSONObject(i)
+                    val epInfo = e.optJSONObject("info")
+                    val ext = e.optString("container_extension").ifBlank { "mp4" }
+                    val epId = e.optString("id")
+                    episodes.add(XtreamEpisode(
+                        id           = epId,
+                        title        = e.optString("title").ifBlank { "Episode ${e.optInt("episode_num")}" },
+                        seasonNum    = seasonKey.toIntOrNull() ?: 0,
+                        episodeNum   = e.optInt("episode_num"),
+                        plot         = epInfo?.optString("plot").orEmpty(),
+                        duration     = epInfo?.optString("duration").orEmpty(),
+                        releaseDate  = epInfo?.optString("releasedate").orEmpty(),
+                        rating       = epInfo?.optString("rating").orEmpty(),
+                        still        = epInfo?.optString("movie_image").ifNullOrBlank { null },
+                        streamUrl    = buildSeriesUrl(epId, ext)
+                    ))
+                }
+            }
+
+            // Fallback: if server returned no seasons block, derive seasons
+            // from episode season keys — common on some Xtream panel builds
+            if (seasons.isEmpty() && episodes.isNotEmpty()) {
+                episodes.map { it.seasonNum }.distinct().sorted().forEach { num ->
+                    seasons.add(XtreamSeason(
+                        seasonNumber = num,
+                        name         = "Season $num",
+                        cover        = null,
+                        episodeCount = episodes.count { it.seasonNum == num }
+                    ))
+                }
+                Log.d(TAG, "Derived ${seasons.size} seasons from episode keys")
+            }
+
+            XtreamSeriesInfo(
+                seriesId    = seriesId,
+                name        = info.optString("name"),
+                cover       = info.optString("cover").ifBlank { null },
+                plot        = info.optString("plot").ifBlank { "" },
+                cast        = info.optString("cast").ifBlank { "" },
+                genre       = info.optString("genre").ifBlank { "" },
+                releaseDate = info.optString("releaseDate").ifBlank { "" },
+                rating      = info.optString("rating").ifBlank { "" },
+                seasons     = seasons.sortedBy { it.seasonNumber },
+                episodes    = episodes.sortedWith(compareBy({ it.seasonNum }, { it.episodeNum }))
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "getSeriesInfo failed for $seriesId: ${e.message}")
+            null
+        }
+    }
+
+    // ── EPG ───────────────────────────────────────────────────────────────────
+
+    /**
+     * Fetch short EPG (current + next programme) for a stream.
+     * Returns empty list on failure — EPG is best-effort.
+     */
+    fun getShortEpg(streamId: String, limit: Int = 2): List<com.kam.magplayer.epg.StalkerEpgEvent> {
+        return try {
+            val obj = get("get_short_epg", "&stream_id=$streamId&limit=$limit")
+            val arr = obj.optJSONArray("epg_listings") ?: return emptyList()
+            (0 until arr.length()).mapNotNull { i ->
+                val e = arr.getJSONObject(i)
+                val start = e.optLong("start_timestamp")
+                val end = e.optLong("stop_timestamp")
+                if (start == 0L || end == 0L) return@mapNotNull null
+                com.kam.magplayer.epg.StalkerEpgEvent(
+                    title       = decodeBase64Title(e.optString("title")),
+                    description = decodeBase64Title(e.optString("description")),
+                    start       = start,
+                    end         = end
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getShortEpg failed for $streamId: ${e.message}")
+            emptyList()
+        }
+    }
+
+// -- Per-category counts (streaming) ---------------------------------------
+
+    /**
+     * Per-category VOD counts: Map<category_id, itemCount>.
+     *
+     * Streams get_vod_streams with android.util.JsonReader and tallies
+     * category_id without ever holding the full list in memory. The full VOD
+     * payload can be 20MB+/50k+ items on real providers, which is why this
+     * does NOT go through getArray()/parseArrayBody() (those cap+truncate at
+     * 8MB and build a full JSON tree). Counts equal what the per-category
+     * browse screen shows because the server filters on the same category_id.
+     *
+     * Returns an empty map on any failure (including OutOfMemoryError) -- a
+     * missing count just means no badge, never a crash.
+     */
+    fun getVodCategoryCounts(): Map<String, Int> = streamCategoryTally("get_vod_streams")
+
+    /**
+     * Per-category Series counts: Map<category_id, showCount>.
+     * Counts are show-counts (not episode-counts), matching the series browse
+     * list. Same streaming + OOM-survivable approach as getVodCategoryCounts().
+     */
+    fun getSeriesCategoryCounts(): Map<String, Int> = streamCategoryTally("get_series")
+
+    /**
+     * Streams a get_..._streams response and tallies the "category_id" field of
+     * every object into a Map<categoryId, count>.
+     *
+     * Memory profile: holds one JSON object's worth of tokens at a time plus
+     * the result map (a few dozen entries). The multi-megabyte body is consumed
+     * incrementally off the socket; it is never materialised as a String or a
+     * JSONArray.
+     *
+     * Tolerates two top-level shapes seen in the wild:
+     *   [ {..}, {..}, ... ]              (bare array -- the common case)
+     *   { "data": [ {..}, {..}, ... ] }  (wrapped -- some panel builds)
+     *
+     * category_id values that are null/blank (the occasional orphan item) are
+     * skipped, so we never invent a phantom category.
+     *
+     * catch (Throwable): an OutOfMemoryError on a pathological provider yields
+     * the partial tally gathered so far (or empty), never a crash -- same
+     * defensive posture as PortalReloader's bulk-count blocks.
+     */
+    private fun streamCategoryTally(action: String): Map<String, Int> {
+        val url = "$serverUrl/player_api.php?username=$username&password=$password&action=$action"
+        Log.d(TAG, "GET (stream tally) $url")
+        val counts = HashMap<String, Int>()
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .build()
+        try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "streamCategoryTally: HTTP ${response.code} for $action")
+                    return counts
+                }
+                val body = response.body ?: run {
+                    Log.w(TAG, "streamCategoryTally: empty body for $action")
+                    return counts
+                }
+                // charStream() reads straight off the socket -- no full-payload
+                // String allocation. JsonReader pulls tokens incrementally.
+                JsonReader(body.charStream()).use { reader ->
+                    readTopLevel(reader, counts)
+                }
+            }
+        } catch (t: Throwable) {
+            // Includes OutOfMemoryError. Return whatever we gathered; a partial
+            // or empty map degrades to "no badge", which is acceptable.
+            Log.w(TAG, "streamCategoryTally($action) aborted: ${t.javaClass.simpleName} ${t.message}")
+        }
+        Log.d(TAG, "streamCategoryTally($action): ${counts.size} categories tallied")
+        return counts
+    }
+
+    /**
+     * Dispatches on the top-level token: either a bare array of items, or an
+     * object that (somewhere) contains a "data" array of items. Anything else
+     * is skipped.
+     */
+    private fun readTopLevel(reader: JsonReader, counts: HashMap<String, Int>) {
+        when (reader.peek()) {
+            JsonToken.BEGIN_ARRAY -> readItemArray(reader, counts)
+            JsonToken.BEGIN_OBJECT -> {
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    val key = reader.nextName()
+                    if (key == "data" && reader.peek() == JsonToken.BEGIN_ARRAY) {
+                        readItemArray(reader, counts)
+                    } else {
+                        reader.skipValue()
+                    }
+                }
+                reader.endObject()
+            }
+            else -> reader.skipValue()
+        }
+    }
+
+    /** Walks an array of stream/series objects, tallying category_id on each. */
+    private fun readItemArray(reader: JsonReader, counts: HashMap<String, Int>) {
+        reader.beginArray()
+        while (reader.hasNext()) {
+            // Per object: read only category_id, skip everything else.
+            var categoryId: String? = null
+            if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    if (reader.nextName() == "category_id") {
+                        categoryId = nextStringOrNull(reader)
+                    } else {
+                        reader.skipValue()
+                    }
+                }
+                reader.endObject()
+            } else {
+                reader.skipValue()
+            }
+            val cid = categoryId?.trim()
+            if (!cid.isNullOrBlank() && cid != "null") {
+                counts[cid] = (counts[cid] ?: 0) + 1
+            }
+        }
+        reader.endArray()
+    }
+
+    /**
+     * Reads the current value as a String regardless of whether the server
+     * encodes category_id as a JSON string ("63") or a number (63). Returns
+     * null for JSON null. Never throws on type -- defends against mixed-type
+     * panels.
+     */
+    private fun nextStringOrNull(reader: JsonReader): String? {
+        return when (reader.peek()) {
+            JsonToken.NULL -> { reader.nextNull(); null }
+            JsonToken.NUMBER, JsonToken.STRING -> reader.nextString()
+            else -> { reader.skipValue(); null }
+        }
+    }
+
+// -- URL builders ----------------------------------------------------------
+
+    fun buildStreamUrl(streamId: String, ext: String = "m3u8") =
+        "$serverUrl/live/$username/$password/$streamId.$ext"
+
+    fun buildVodUrl(streamId: String, ext: String = "mp4") =
+        "$serverUrl/movie/$username/$password/$streamId.$ext"
+
+    fun buildSeriesUrl(episodeId: String, ext: String = "mp4") =
+        "$serverUrl/series/$username/$password/$episodeId.$ext"
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private fun decodeBase64Title(encoded: String): String {
+        return try {
+            String(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT))
+        } catch (e: Exception) {
+            encoded  // Already plain text on some servers
+        }
+    }
+
+    private fun String?.ifNullOrBlank(default: () -> String?): String? =
+        if (isNullOrBlank()) default() else this
+}
+
+// ── Data models for Xtream series ────────────────────────────────────────────
+
+data class XtreamSeriesInfo(
+    val seriesId: String,
+    val name: String,
+    val cover: String?,
+    val plot: String,
+    val cast: String,
+    val genre: String,
+    val releaseDate: String,
+    val rating: String,
+    val seasons: List<XtreamSeason>,
+    val episodes: List<XtreamEpisode>
+)
+
+data class XtreamSeason(
+    val seasonNumber: Int,
+    val name: String,
+    val cover: String?,
+    val episodeCount: Int
+)
+
+data class XtreamEpisode(
+    val id: String,
+    val title: String,
+    val seasonNum: Int,
+    val episodeNum: Int,
+    val plot: String,
+    val duration: String,
+    val releaseDate: String,
+    val rating: String,
+    val still: String?,
+    val streamUrl: String
+)
