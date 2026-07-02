@@ -1,0 +1,1795 @@
+package com.kam.magplayer
+
+import android.content.Context
+import android.util.Log
+import androidx.compose.animation.core.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.*
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.tv.material3.*
+import android.widget.Toast
+import coil.compose.AsyncImage
+import com.kam.magplayer.epg.EpgRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
+
+// -----------------------------------------------------------------------------
+// Models
+// -----------------------------------------------------------------------------
+
+data class CategoryItem(val id: String, val name: String, var isFavorite: Boolean)
+
+enum class CategoryLayoutMode { COMPACT, GRID, GROUPED }
+
+private const val FAV_CHANNELS_ID = "__fav_channels__"
+
+// -----------------------------------------------------------------------------
+// Region accent colours
+// -----------------------------------------------------------------------------
+
+private val regionColors = mapOf(
+    "PL" to Color(0xFF3B82F6),
+    "EN" to Color(0xFF10B981),
+    "UK" to Color(0xFF10B981),
+    "US" to Color(0xFF10B981),
+    "DE" to Color(0xFFF59E0B),
+    "FR" to Color(0xFF6366F1),
+    "IT" to Color(0xFF22C55E),
+    "ES" to Color(0xFFEF4444),
+    "NL" to Color(0xFFF97316),
+    "PT" to Color(0xFF84CC16),
+    "RU" to Color(0xFFEC4899),
+    "RS" to Color(0xFFA78BFA),
+    "HR" to Color(0xFF0EA5E9),
+    "SK" to Color(0xFF3B82F6),
+    "CZ" to Color(0xFF3B82F6),
+    "HU" to Color(0xFFF59E0B),
+    "RO" to Color(0xFFF59E0B),
+    "BG" to Color(0xFF6366F1),
+    "GR" to Color(0xFF3B82F6),
+    "SE" to Color(0xFFFBBF24),
+    "NO" to Color(0xFFEF4444),
+    "DK" to Color(0xFFEF4444),
+    "FI" to Color(0xFF3B82F6),
+    "TR" to Color(0xFFEF4444),
+    "ARAB" to Color(0xFF14B8A6),
+    "AR" to Color(0xFF14B8A6),
+    "AFR" to Color(0xFFF97316),
+    "AFRICA" to Color(0xFFF97316),
+    "IN" to Color(0xFFF59E0B),
+    "PK" to Color(0xFF22C55E),
+    "BD" to Color(0xFF22C55E),
+    "CN" to Color(0xFFEF4444),
+    "JP" to Color(0xFFEC4899),
+    "KR" to Color(0xFF8B5CF6),
+    "TH" to Color(0xFF8B5CF6),
+    "VIP" to Color(0xFFFBBF24),
+    "4K" to Color(0xFF8B5CF6),
+    "UHD" to Color(0xFF8B5CF6),
+    "FHD" to Color(0xFF6366F1),
+    "XXX" to Color(0xFFEF4444),
+    "ADULT" to Color(0xFFEF4444),
+)
+private val defaultAccent = Color(0xFF64748B)
+
+private fun extractPrefix(name: String): String {
+    val pipeIdx = name.indexOf('|')
+    if (pipeIdx > 0) return name.substring(0, pipeIdx).trim().uppercase()
+    val firstWord = name.substringBefore(' ').trim().uppercase()
+    return if (regionColors.containsKey(firstWord)) firstWord else ""
+}
+
+private fun accentFor(name: String): Color = regionColors[extractPrefix(name)] ?: defaultAccent
+
+private fun stripPrefix(name: String): Pair<String, String> {
+    val pipeIdx = name.indexOf('|')
+    if (pipeIdx > 0) {
+        return name.substring(0, pipeIdx).trim() to name.substring(pipeIdx + 1).trim()
+    }
+    val firstWord = name.substringBefore(' ').trim()
+    return if (regionColors.containsKey(firstWord.uppercase()))
+        firstWord to name.substring(firstWord.length).trim()
+    else "" to name
+}
+
+/** Cached prefix data per row -- avoids recomputing on every recomposition. */
+private data class PrefixInfo(val prefix: String, val display: String, val accent: Color)
+
+@Composable
+private fun rememberPrefixInfo(name: String): PrefixInfo = remember(name) {
+    val (prefix, display) = stripPrefix(name)
+    PrefixInfo(prefix, display.ifEmpty { name }, accentFor(name))
+}
+
+// -----------------------------------------------------------------------------
+// Logo prefetch cache
+//
+// Top-level so logos persist across fragment re-creations in the same session
+// (avoiding redundant network calls), but capped via clearPrefetchedLogos()
+// called from the fragment's onDestroyView.
+// -----------------------------------------------------------------------------
+
+private val prefetchedLogos = mutableStateMapOf<String, List<String>>()
+
+fun clearPrefetchedLogos() = prefetchedLogos.clear()
+
+object CategoryLogoPrefetcher {
+
+    private var currentJob: kotlinx.coroutines.Job? = null
+
+    fun start(
+        scope: kotlinx.coroutines.CoroutineScope,
+        context: Context,
+        categories: List<CategoryItem>,
+        contentType: ContentType,
+        portalId: String,
+        isDirectClientPortal: Boolean,   // true for M3U or Xtream
+        portalUrl: String,
+        macAddress: String
+    ) {
+        // Always cancel any previous job. By the time start() is called from a
+        // new composition, the old composition is already torn down -- its
+        // coroutine scope is dead and the cancel is a harmless no-op.
+        currentJob?.cancel()
+
+        currentJob = scope.launch(Dispatchers.IO) {
+            val ordered = categories.sortedByDescending { it.isFavorite }
+            for (category in ordered) {
+                if (!isActive) break
+                if (prefetchedLogos[category.id]?.isNotEmpty() == true) continue
+
+                try {
+                    val logos = fetchLogosForCategory(
+                        context, portalId, category.id, contentType,
+                        isDirectClientPortal, portalUrl
+                    )
+                    if (logos.isNotEmpty()) {
+                        withContext(Dispatchers.Main) { prefetchedLogos[category.id] = logos }
+                    }
+                } catch (_: Exception) {}
+
+                if (!category.isFavorite) delay(120)
+            }
+        }
+    }
+
+    fun cancel() {
+        currentJob?.cancel()
+        currentJob = null
+    }
+
+    private suspend fun fetchLogosForCategory(
+        context: Context,
+        portalId: String,
+        categoryId: String,
+        contentType: ContentType,
+        isDirectClientPortal: Boolean,
+        portalUrl: String
+    ): List<String> {
+        val cache = PortalCache.get(portalId)
+
+        // Already in cache?
+        cache.channelPagesByGenre[categoryId]?.values?.flatten()?.let { channels ->
+            return channels.mapNotNull { it.logo?.takeIf { l -> l.startsWith("http") } }
+                .distinct().take(4)
+        }
+
+        // Need to fetch
+        val channels = if (isDirectClientPortal) {
+            M3uCache.loadChannelsForCategory(context, portalUrl, categoryId, contentType)
+                ?.also { ch ->
+                    cache.channelPagesByGenre.getOrPut(categoryId) { mutableMapOf() }[1] = ch
+                } ?: emptyList()
+        } else {
+            val page = StalkerSession.client.getChannelsPage(categoryId, page = 1, limit = 20)
+            cache.channelPagesByGenre.getOrPut(categoryId) { mutableMapOf() }[1] = page.channels
+            page.channels
+        }
+
+        return channels.mapNotNull { it.logo?.takeIf { l -> l.startsWith("http") } }
+            .distinct().take(4)
+    }
+}
+
+@Composable
+private fun rememberCategoryLogos(
+    categoryId: String,
+    contentType: ContentType,
+    maxLogos: Int = 4
+): List<String> {
+    // Fast path
+    prefetchedLogos[categoryId]?.takeIf { it.isNotEmpty() }?.let { return it.take(maxLogos) }
+
+    val context = LocalContext.current
+    val logos = remember(categoryId, contentType) { mutableStateOf<List<String>>(emptyList()) }
+
+    // Stagger first-frame I/O so all visible rows don't simultaneously hit disk
+    var isVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(categoryId) {
+        delay(50)
+        isVisible = true
+    }
+
+    LaunchedEffect(categoryId, contentType, isVisible) {
+        if (!isVisible || logos.value.isNotEmpty()) return@LaunchedEffect
+        val activeId = withContext(Dispatchers.IO) {
+            PortalRepository(context).getActivePortalId()
+        } ?: return@LaunchedEffect
+        val channels = PortalCache.get(activeId).channelPagesByGenre[categoryId]
+            ?.values?.flatten() ?: return@LaunchedEffect
+        logos.value = channels
+            .mapNotNull { it.logo?.takeIf { l -> l.startsWith("http") } }
+            .distinct().take(maxLogos)
+    }
+
+    return logos.value
+}
+
+// -----------------------------------------------------------------------------
+// Category loading -- single suspend loader replaces the old 3-way branch
+// -----------------------------------------------------------------------------
+
+/**
+ * Returns the list of categories for a portal + content type, populating the
+ * PortalCache as a side effect. The cache's mutable lists are the source of
+ * truth -- this function just reads them, refreshing from the network if empty.
+ */
+private suspend fun loadCategoriesFor(
+    portal: Portal,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    context: Context
+): List<CategoryItem> = withContext(Dispatchers.IO) {
+    val cache = PortalCache.get(portal.id)
+
+    when (contentType) {
+        ContentType.IPTV -> {
+            if (cache.genres.isEmpty()) {
+                val genres = when {
+                    portal.isM3U -> {
+                        M3uCache.loadMeta(context, portal.effectiveUrl)?.genres ?: emptyList()
+                    }
+                    portal.isXtream -> {
+                        XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                            .getLiveCategories()
+                            .map { StalkerGenre(it.id, it.title, "") }
+                    }
+                    else -> {
+                        val sc = viewModel.getStalkerClient(portal.effectiveUrl, portal.macAddress)
+                        StalkerSession.client = sc
+                        sc.getGenres()
+                    }
+                }
+                if (genres.isNotEmpty()) {
+                    cache.genres.clear(); cache.genres.addAll(genres)
+                    CategoryStore.saveGenres(context, portal.id, genres)   // <-- ADD
+                }
+            }
+            cache.genres.map { CategoryItem(it.id, it.title, false) }
+        }
+
+        ContentType.VOD -> {
+            if (cache.vodCategories.isEmpty()) {
+                val cats = when {
+                    portal.isM3U -> M3uCache.loadMeta(context, portal.effectiveUrl)?.vodCategories ?: emptyList()
+                    portal.isXtream -> XtreamClient(portal.effectiveUrl, portal.username, portal.password).getVodCategories()
+                    else -> viewModel.getVodClient(portal.effectiveUrl, portal.macAddress).getVodCategories()
+                }
+                if (cats.isNotEmpty()) {
+                    cache.vodCategories.clear(); cache.vodCategories.addAll(cats)
+                    CategoryStore.saveCategories(context, portal.id, ContentType.VOD, cats)   // <-- ADD
+                }
+            }
+            cache.vodCategories.map { CategoryItem(it.id, it.title, false) }
+        }
+
+        ContentType.SERIES -> {
+            if (cache.seriesCategories.isEmpty()) {
+                val cats = when {
+                    portal.isM3U -> M3uCache.loadMeta(context, portal.effectiveUrl)?.seriesCategories ?: emptyList()
+                    portal.isXtream -> XtreamClient(portal.effectiveUrl, portal.username, portal.password).getSeriesCategories()
+                    else -> viewModel.getVodClient(portal.effectiveUrl, portal.macAddress).getSeriesCategories()
+                }
+                if (cats.isNotEmpty()) {
+                    cache.seriesCategories.clear(); cache.seriesCategories.addAll(cats)
+                    CategoryStore.saveCategories(context, portal.id, ContentType.SERIES, cats)   // <-- ADD
+                }
+            }
+            cache.seriesCategories.map { CategoryItem(it.id, it.title, false) }
+        }
+    }
+}
+
+/** Reads whichever cached list matches the content type, without any network. */
+private fun cachedCategoriesFor(portal: Portal, contentType: ContentType): List<CategoryItem> {
+    val cache = PortalCache.get(portal.id)
+    return when (contentType) {
+        ContentType.IPTV   -> cache.genres.map { CategoryItem(it.id, it.title, false) }
+        ContentType.VOD    -> cache.vodCategories.map { CategoryItem(it.id, it.title, false) }
+        ContentType.SERIES -> cache.seriesCategories.map { CategoryItem(it.id, it.title, false) }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Fragment
+// -----------------------------------------------------------------------------
+
+class CategoryBrowseComposeFragment : Fragment() {
+
+    companion object {
+        private const val ARG_CONTENT_TYPE = "content_type"
+
+        // Bump to force-wipe all EPG cache files on next launch.
+        private const val EPG_CACHE_VERSION = 2
+
+        // Guards rapid re-entry into the EPG download from concurrent
+        // onViewCreated calls. AtomicLong.compareAndSet replaces the previous
+        // unsynchronised read-then-write of EpgRepository.lastEpgLoadAttemptMs.
+        private val epgDownloadStartedAt = AtomicLong(0L)
+
+        // Guards the one-time startup reload (when no counts are on disk) so it
+        // fires at most once per portal per process, never on every launch.
+        private val startupReloadAttempted =
+            java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+        fun newInstance(contentType: ContentType): CategoryBrowseComposeFragment =
+            CategoryBrowseComposeFragment().apply {
+                arguments = android.os.Bundle().apply {
+                    putString(ARG_CONTENT_TYPE, contentType.name)
+                }
+            }
+    }
+
+    override fun onCreateView(
+        inflater: android.view.LayoutInflater,
+        container: android.view.ViewGroup?,
+        savedInstanceState: android.os.Bundle?
+    ): android.view.View {
+        val contentType = ContentType.valueOf(
+            arguments?.getString(ARG_CONTENT_TYPE) ?: ContentType.IPTV.name
+        )
+        val viewModel = ViewModelProvider(requireActivity())[TvHomeViewModel::class.java]
+
+        return androidx.compose.ui.platform.ComposeView(requireContext()).apply {
+            setViewCompositionStrategy(
+                androidx.compose.ui.platform.ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+            )
+            setContent {
+                androidx.compose.material3.MaterialTheme {
+                    CategoryBrowseScreen(
+                        contentType = contentType,
+                        viewModel = viewModel,
+                        onCategorySelected = { id, name ->
+                            tvGoDrillDown(ContentBrowseComposeFragment.newInstance(contentType, id, name))
+                        },
+                        onNavigate = { fragment -> tvGoTopLevel(fragment) }
+                    )
+                }
+            }
+        }
+    }
+
+    override fun onViewCreated(view: android.view.View, savedInstanceState: android.os.Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        val contentType = ContentType.valueOf(
+            arguments?.getString(ARG_CONTENT_TYPE) ?: ContentType.IPTV.name
+        )
+        if (contentType != ContentType.IPTV) return
+
+        val context = requireContext()
+        val viewModel = ViewModelProvider(requireActivity())[TvHomeViewModel::class.java]
+
+        // EPG download must survive fragment navigation -- use the application
+        // scope so the download completes even if the user taps a category
+        // while the .gz is still downloading.
+        val appScope = ProcessLifecycleOwner.get().lifecycleScope
+
+        appScope.launch(Dispatchers.IO) {
+            runCatching { downloadEpgIfNeeded(context, viewModel) }
+                .onFailure { Log.e("EPG_DIAG", "EPG setup error: ${it.message}") }
+        }
+
+        // Startup counts: restore from disk (instant, no network) and, only if
+        // nothing was saved for this portal, fall back to a one-time background
+        // reload to populate them. Runs in appScope so it survives the user
+        // navigating into a category while it works.
+        appScope.launch(Dispatchers.IO) {
+            runCatching { restoreOrReloadCounts(context) }
+                .onFailure { Log.w("CountStartup", "startup count task failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * Cheap-first startup count population:
+     *   1. Restore persisted counts from disk. If anything was restored, bump
+     *      the count-version signal so the category screen re-reads + shows them.
+     *   2. If NOTHING was on disk (restored == 0) -- fresh install or a portal
+     *      never reloaded -- do a one-time full reload to populate + persist,
+     *      which bumps the signal itself on completion (PortalReloader.reload).
+     *
+     * The reloadAttempted guard makes step 2 fire at most once per portal per
+     * process, so we never auto-reload on every launch -- only when there's
+     * genuinely nothing to show. Best-effort throughout; failures just leave
+     * counts to the existing on-demand path.
+     */
+    private suspend fun restoreOrReloadCounts(context: Context) {
+        val repo = PortalRepository(context)
+        val portal = repo.getPortals().find { it.id == repo.getActivePortalId() } ?: return
+
+        val cache = PortalCache.get(portal.id)
+
+        // Step 1: restore from disk.
+        val restored = ChannelCountStore.restore(context, portal.id, cache)
+        if (restored > 0) {
+            Log.d("CountStartup", "Restored $restored counts from disk for ${portal.name}")
+            PortalCache.bumpCountsVersion()
+            return
+        }
+
+        // Step 2: nothing saved -> one-time background reload to populate.
+        val key = "startup_reload:${portal.id}"
+        val flag = startupReloadAttempted.getOrPut(key) { java.util.concurrent.atomic.AtomicBoolean(false) }
+        if (!flag.compareAndSet(false, true)) {
+            Log.d("CountStartup", "Startup reload already attempted this session for ${portal.name}")
+            return
+        }
+        Log.d("CountStartup", "No saved counts for ${portal.name} -- running one-time startup reload")
+        // PortalReloader.reload populates + persists the maps and bumps
+        // countsVersion itself on completion, so the screen updates when done.
+        PortalReloader.reload(context, portal)
+    }
+
+    private suspend fun downloadEpgIfNeeded(context: Context, viewModel: TvHomeViewModel) {
+        val portalRepo = PortalRepository(context)
+        val activePortal = portalRepo.getPortals().find { it.id == portalRepo.getActivePortalId() }
+            ?: return
+
+        val epgUrl = activePortal.epgUrl.orEmpty()
+            .ifBlank { activePortal.xmltvUrl.orEmpty() }
+        if (epgUrl.isBlank()) return
+
+        val nowMs = System.currentTimeMillis()
+        val timeSinceLast = nowMs - EpgRepository.lastEpgLoadAttemptMs
+        val hasData = EpgRepository.hasXmlTvData()
+
+        Log.d("EPG_DIAG", "epgUrl='$epgUrl' lastAttempt=${timeSinceLast / 1000}s hasData=$hasData")
+
+        // Skip if we have fresh data, or if we recently failed and need to back off
+        if (hasData && timeSinceLast < 4 * 60 * 60 * 1000L) return
+        if (!hasData && timeSinceLast in 1L until 5_000L) return
+
+        // Atomic guard: only one download in flight at a time
+        if (!epgDownloadStartedAt.compareAndSet(0L, nowMs) &&
+            (nowMs - epgDownloadStartedAt.get()) < 60_000L) {
+            Log.d("EPG_DIAG", "EPG download already in progress, skipping")
+            return
+        }
+        EpgRepository.lastEpgLoadAttemptMs = nowMs
+
+        try {
+            val prefs = context.getSharedPreferences("epg_prefs", Context.MODE_PRIVATE)
+
+            // Cache versioning + URL change detection
+            val storedVersion = prefs.getInt("epg_cache_version", 0)
+            if (storedVersion < EPG_CACHE_VERSION) {
+                Log.d("EPG_DIAG", "Cache version bump ($storedVersion -> $EPG_CACHE_VERSION)")
+                com.kam.magplayer.epg.ExternalEpgManager.clearAllCaches(context)
+                prefs.edit().putInt("epg_cache_version", EPG_CACHE_VERSION).apply()
+            }
+            val lastUrl = prefs.getString("last_epg_url", null)
+            if (lastUrl != epgUrl) {
+                Log.d("EPG_DIAG", "URL changed ($lastUrl -> $epgUrl) -- clearing caches")
+                com.kam.magplayer.epg.ExternalEpgManager.clearAllCaches(context)
+                prefs.edit().putString("last_epg_url", epgUrl).apply()
+            }
+
+            val httpClient = if (!activePortal.isM3U && !activePortal.isXtream) {
+                viewModel.getStalkerClient(activePortal.effectiveUrl, activePortal.macAddress)
+                    .getHttpClient()
+            } else okhttp3.OkHttpClient()
+
+            val map = com.kam.magplayer.epg.XmlTvLoader.loadXmlTv(epgUrl, httpClient, context = context)
+            Log.d("EPG_DIAG", "Loaded ${map.size} channels")
+
+            if (map.isNotEmpty()) {
+                EpgRepository.putXmlTvMap(map)
+                EpgRepository.setOverrides(com.kam.magplayer.epg.EpgOverrideRepository(context).getOverrides(activePortal.id))
+            } else {
+                Log.w("EPG_DIAG", "Map empty -- resetting timestamp for retry")
+                EpgRepository.lastEpgLoadAttemptMs = 0L
+            }
+        } catch (e: Exception) {
+            Log.e("EPG_DIAG", "Download failed: ${e.message}")
+            EpgRepository.lastEpgLoadAttemptMs = 0L
+        } finally {
+            epgDownloadStartedAt.set(0L)
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        CategoryLogoPrefetcher.cancel()
+        clearPrefetchedLogos()
+        Log.d("CategoryBrowse", "onDestroyView -- prefetcher cancelled, logo cache cleared")
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Screen
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun CategoryBrowseScreen(
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    onCategorySelected: (String, String) -> Unit,
+    onNavigate: (Fragment) -> Unit = {}
+) {
+    val context = LocalContext.current
+    val portalRepository = remember { PortalRepository(context) }
+    val favoriteRepository = remember { FavoriteRepository(context) }
+    val categoryFilterRepo = remember { CategoryFilterRepository(context) }
+    val parentalRepo = remember { ParentalControlsRepository(context) }
+    val scope = rememberCoroutineScope()
+    val focusManager = LocalFocusManager.current
+
+    // -- Core state ----------------------------------------------------------
+    val allCategories = remember { mutableStateListOf<CategoryItem>() }
+    val favoriteIds = remember { mutableStateOf<Set<String>>(emptySet()) }
+    var activePortalId by remember { mutableStateOf<String?>(null) }
+    var searchQuery by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var searchFocused by remember { mutableStateOf(false) }
+    var layoutMode by remember { mutableStateOf(CategoryLayoutMode.COMPACT) }
+    var lastSelectedCategoryId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Re-trigger load on lifecycle resume (e.g. coming back from settings).
+    // Also re-triggered by a coarse time tick so unlock-window expiry is
+    // reflected naturally without explicit cross-screen signalling.
+    var filterVersion by remember { mutableStateOf(0) }
+
+    // PinDialog trigger: when non-null, the dialog is shown at the bottom of
+    // this composable to handle PIN setup for a brand-new lock action.
+    var categoryAwaitingPinSetup by remember { mutableStateOf<CategoryItem?>(null) }
+
+    val title = when (contentType) {
+        ContentType.IPTV -> stringResource(id = R.string.category_title_iptv)
+        ContentType.VOD -> stringResource(id = R.string.category_title_vod)
+        ContentType.SERIES -> stringResource(id = R.string.category_title_series)
+    }
+
+    // -- Filtered + sorted list ----------------------------------------------
+    // Sorting only re-runs when the *size* or search changes -- not when a
+    // favourite toggles. That keeps LazyColumn keys stable during * clicks so
+    // D-pad focus is never lost. */* display is driven by `favoriteIds` instead.
+    val filteredCategories by remember(allCategories, searchQuery) {
+        derivedStateOf {
+            val src = if (searchQuery.isBlank()) allCategories
+            else allCategories.filter { it.name.contains(searchQuery, ignoreCase = true) }
+            src.sortedWith(compareByDescending<CategoryItem> { it.id in favoriteIds.value }.thenBy { it.name })
+        }
+    }
+// Back handling. This screen had none, so D-pad Back while the search field
+    // was focused (keyboard up) left the user stuck: the IME ate the event but
+    // nothing cleared focus or dismissed the keyboard. Enabled only when there's
+    // something search-related to clean up, so normal "Back exits the screen"
+    // behaviour is untouched when the handler is disabled.
+    BackHandler(enabled = searchFocused || searchQuery.isNotBlank()) {
+        when {
+            searchFocused -> {
+                focusManager.clearFocus()
+                searchFocused = false
+            }
+            searchQuery.isNotBlank() -> {
+                searchQuery = ""
+            }
+        }
+    }
+    // -- Lifecycle: refresh on resume ----------------------------------------
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                categoryFilterRepo.invalidateCache()
+                filterVersion++
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // -- Favourite toggle plumbing -------------------------------------------
+    suspend fun refreshFavorites() {
+        val newFavs = withContext(Dispatchers.IO) {
+            val active = portalRepository.getActivePortal() ?: return@withContext emptySet()
+            favoriteRepository.getFavoriteCategories(active.macAddress, contentType).toSet()
+        }
+        favoriteIds.value = newFavs
+    }
+
+    val onFavoriteToggle: (CategoryItem) -> Unit = remember(contentType) {
+        { item ->
+            scope.launch(Dispatchers.IO) {
+                val active = portalRepository.getActivePortal() ?: return@launch
+                val mac = active.macAddress
+                if (item.id in favoriteIds.value) {
+                    favoriteRepository.removeFavoriteCategory(mac, contentType, item.id)
+                } else {
+                    favoriteRepository.addFavoriteCategory(mac, contentType, item.id)
+                }
+                refreshFavorites()
+            }
+            Unit
+        }
+    }
+
+    // -- Dots-menu action handlers -------------------------------------------
+    val onLockClick: (CategoryItem) -> Unit = { item ->
+        val portalIdSnapshot = activePortalId
+        when {
+            portalIdSnapshot.isNullOrBlank() -> {
+                Toast.makeText(context, context.getString(R.string.error_no_active_portal), Toast.LENGTH_SHORT).show()
+            }
+            parentalRepo.isEnabled(portalIdSnapshot) -> {
+                // PIN already set: just lock the category immediately.
+                scope.launch(Dispatchers.IO) {
+                    parentalRepo.lockCategory(portalIdSnapshot, item.id)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.parental_toast_locked, item.name),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        filterVersion++
+                    }
+                }
+            }
+            else -> {
+                // No PIN yet: trigger PinDialog at the layout level (below).
+                categoryAwaitingPinSetup = item
+            }
+        }
+    }
+
+    val onHideClick: (CategoryItem) -> Unit = { item ->
+        scope.launch(Dispatchers.IO) {
+            categoryFilterRepo.hideCategory(item.name)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.parental_toast_hidden, item.name),
+                    Toast.LENGTH_SHORT
+                ).show()
+                filterVersion++
+            }
+        }
+    }
+
+    // -- Wrapped category selection (handles synthetic favourites entry) ----
+    val wrappedOnCategorySelected = remember<(String, String) -> Unit>(
+        scope, portalRepository, context, onCategorySelected
+    ) {
+        { id, name ->
+            lastSelectedCategoryId = id
+            if (id == FAV_CHANNELS_ID) {
+                scope.launch(Dispatchers.IO) {
+                    val portal = portalRepository.getActivePortal()
+                    if (portal != null) {
+                        val favChannels = FavoriteChannelsRepository(context).getFavoriteChannels(portal.id)
+                        PortalCache.get(portal.id).channelPagesByGenre
+                            .getOrPut(FAV_CHANNELS_ID) { mutableMapOf() }[1] = favChannels
+                    }
+                    withContext(Dispatchers.Main) { onCategorySelected(id, name) }
+                }
+            } else {
+                onCategorySelected(id, name)
+            }
+        }
+    }
+
+    // -- Main load effect ----------------------------------------------------
+    LaunchedEffect(contentType, filterVersion) {
+        isLoading = true
+        errorMessage = null
+        try {
+            val activePortal = withContext(Dispatchers.IO) { portalRepository.getActivePortal() }
+                ?: run { errorMessage = context.getString(R.string.error_no_active_portal); isLoading = false; return@LaunchedEffect }
+            activePortalId = activePortal.id
+
+            // Cold-start recovery: if the in-memory cache was wiped (process
+            // death under memory pressure on a quick back-out from the player),
+            // repaint from disk BEFORE any network handshake. Mirrors
+            // ChannelCountStore for counts. Without this, an empty cache forces
+            // a live getGenres() handshake whose transient failure blanks the
+            // screen to the portal-handshake / no-categories error.
+            withContext(Dispatchers.IO) {
+                val restored = CategoryStore.restore(
+                    context, activePortal.id, PortalCache.get(activePortal.id)
+                )
+                if (restored > 0)
+                    Log.d("CategoryBrowse", "Restored $restored categories from disk")
+            }
+
+
+            // Parental control filter -- per portal. Computed once per load so
+            // both the cachedFast and fetched paths apply the same rule.
+            // Empty set when parental controls are disabled OR the session is
+            // currently unlocked, which makes the .filter step a no-op.
+            val parentallyLocked: Set<String> =
+                if (parentalRepo.isEnabled(activePortal.id) &&
+                    !ParentalSession.isUnlocked(activePortal.id))
+                    parentalRepo.getLockedCategoryIds(activePortal.id)
+                else emptySet()
+
+            // Fast path: show whatever's already cached. Doesn't clear isLoading
+            // because the network refresh underneath might still update things.
+            val cachedFast = cachedCategoriesFor(activePortal, contentType)
+                .distinctBy { it.id }
+                .filter { categoryFilterRepo.shouldShowCategory(it.name) }
+                .filter { it.id !in parentallyLocked }
+            if (cachedFast.isNotEmpty() && allCategories.isEmpty()) {
+                allCategories.clear(); allCategories.addAll(cachedFast)
+            }
+
+            // Full load (no-op if cache is already populated)
+            val fetched = loadCategoriesFor(activePortal, contentType, viewModel, context)
+                .distinctBy { it.id }
+                .filter { categoryFilterRepo.shouldShowCategory(it.name) }
+                .filter { it.id !in parentallyLocked }
+
+            // Inject synthetic "* Favourite Channels" entry at the top for IPTV.
+            // Stays unfiltered by parental controls -- it's a meta-entry that
+            // references the user's hand-picked channel favourites, not a
+            // portal-side category.
+            val withFavChannels = if (contentType == ContentType.IPTV) {
+                val favCount = withContext(Dispatchers.IO) {
+                    FavoriteChannelsRepository(context).getFavoriteChannels(activePortal.id).size
+                }
+                if (favCount > 0) {
+                    listOf(CategoryItem(FAV_CHANNELS_ID, context.getString(R.string.category_fav_channels_count, favCount), false)) + fetched
+                } else fetched
+            } else fetched
+
+// Only replace the visible list if the load actually produced
+            // categories. On a fast back-press the handshake can fail and
+            // loadCategoriesFor returns empty -- in that case keep whatever is
+            // already shown (cachedFast) instead of blanking to an error.
+            if (withFavChannels.isNotEmpty()) {
+                allCategories.clear()
+                allCategories.addAll(withFavChannels)
+            } else if (allCategories.isEmpty() && cachedFast.isNotEmpty()) {
+                allCategories.clear()
+                allCategories.addAll(cachedFast)
+            }
+            refreshFavorites()
+
+// Background logo prefetch (IPTV only).
+// M3U excluded: for M3U portals, fetchLogosForCategory falls through to
+// M3uCache.loadChannelsForCategory, which re-scans the entire playlist file
+// per category -- a sustained full-file-scan storm that thrashes GC on
+// low-RAM boxes (Shield/Amlogic/Rockchip ANRs). Stalker/Xtream keep their
+// cheap 20-channel page prefetch. M3U logos still fill in lazily via
+// rememberCategoryLogos once a category is opened and its channels cached.
+            if (contentType == ContentType.IPTV && !activePortal.isM3U) {
+                try {
+                    CategoryLogoPrefetcher.start(
+                        scope = scope,
+                        context = context,
+                        categories = allCategories,
+                        contentType = contentType,
+                        portalId = activePortal.id,
+                        isDirectClientPortal = activePortal.isXtream,   // M3U no longer reaches here
+                        portalUrl = activePortal.effectiveUrl,
+                        macAddress = activePortal.macAddress
+                    )
+                } catch (_: Exception) { /* scope already dead */ }
+            }
+        } catch (e: IOException) {
+            // Don't show a handshake error if we already have a usable list --
+            // this is the fast-back-press case where the refresh failed but the
+            // cache is intact. Only error when there's genuinely nothing to show.
+            if (allCategories.isEmpty()) {
+                errorMessage = context.getString(R.string.error_portal_handshake)
+            }
+        } catch (e: Exception) {
+            // Suppress internal Compose/coroutine errors -- they're framework
+            // noise from navigation timing, not real portal failures.
+            val msg = e.message ?: ""
+            errorMessage = when {
+                msg.contains("coroutine scope", ignoreCase = true) ||
+                        msg.contains("composition", ignoreCase = true) ||
+                        msg.contains("left the composition", ignoreCase = true) -> null
+                msg.isBlank() -> context.getString(R.string.error_unknown)
+                else -> msg
+            }
+        } finally {
+            isLoading = false
+        }
+    }
+
+    // -- Layout --------------------------------------------------------------
+    val listFocusRequester = remember { FocusRequester() }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Image(
+            painter = painterResource(id = R.drawable.tvbackground),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop
+        )
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+
+        Row(modifier = Modifier.fillMaxSize()) {
+            Sidebar(onNavigate)
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .padding(start = 32.dp, end = 32.dp, top = 16.dp, bottom = 24.dp)
+            ) {
+                Header(
+                    title = title,
+                    layoutMode = layoutMode,
+                    onLayoutToggle = {
+                        layoutMode = when (layoutMode) {
+                            CategoryLayoutMode.COMPACT -> CategoryLayoutMode.GRID
+                            CategoryLayoutMode.GRID -> CategoryLayoutMode.GROUPED
+                            CategoryLayoutMode.GROUPED -> CategoryLayoutMode.COMPACT
+                        }
+                    },
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = { searchQuery = it },
+                    searchFocused = searchFocused,
+                    onSearchFocusChange = { searchFocused = it }
+                )
+
+                when {
+                    filteredCategories.isNotEmpty() -> {
+                        LaunchedEffect(filteredCategories.size, searchFocused) {
+                            // When returning to a remembered category, CompactList
+                            // handles focus via its per-row requester. Only do the
+                            // default top-focus when there's no category to restore.
+                            if (!searchFocused && filteredCategories.isNotEmpty()
+                                && lastSelectedCategoryId == null) {
+                                kotlinx.coroutines.delay(60)
+                                runCatching { listFocusRequester.requestFocus() }
+                            }
+                        }
+                        CategoryListContent(
+                            mode = layoutMode,
+                            categories = filteredCategories,
+                            contentType = contentType,
+                            viewModel = viewModel,
+                            focusRequester = listFocusRequester,
+                            favoriteIds = favoriteIds.value,
+                            onSelected = wrappedOnCategorySelected,
+                            onFavoriteToggle = onFavoriteToggle,
+                            onLockClick = onLockClick,
+                            onHideClick = onHideClick,
+                            portalId = activePortalId,
+                            cacheVersion = filterVersion,
+                            targetCategoryId = lastSelectedCategoryId
+                        )
+                    }
+                    isLoading -> LoadingState()
+                    !errorMessage.isNullOrBlank() -> ErrorState(errorMessage!!)
+                    else -> EmptyState()
+                }
+            }
+        }
+
+        // PinDialog overlay -- lives at the outer Box level so it overlays
+        // the screen content. Triggered when onLockClick fires while no PIN
+        // has been set; sets the PIN AND locks the chosen category atomically
+        // on confirm.
+        categoryAwaitingPinSetup?.let { itemToLock ->
+            val portalIdSnapshot = activePortalId
+            if (portalIdSnapshot.isNullOrBlank()) {
+                categoryAwaitingPinSetup = null
+            } else {
+                PinDialog(
+                    mode = PinDialogMode.Setup,
+                    onConfirm = { pin ->
+                        scope.launch(Dispatchers.IO) {
+                            parentalRepo.setPin(portalIdSnapshot, pin)
+                            parentalRepo.lockCategory(portalIdSnapshot, itemToLock.id)
+                            withContext(Dispatchers.Main) {
+                                categoryAwaitingPinSetup = null
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.parental_toast_locked_setup, itemToLock.name),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                filterVersion++
+                            }
+                        }
+                    },
+                    onCancel = { categoryAwaitingPinSetup = null }
+                )
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Header (title + layout toggle + search)
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun Header(
+    title: String,
+    layoutMode: CategoryLayoutMode,
+    onLayoutToggle: () -> Unit,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
+    searchFocused: Boolean,
+    onSearchFocusChange: (Boolean) -> Unit
+) {
+    val focusManager = LocalFocusManager.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            LayoutToggleButton(layoutMode, onLayoutToggle)
+            Box(
+                modifier = Modifier
+                    .width(300.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .border(
+                        width = 1.dp,
+                        color = if (searchFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                if (searchQuery.isEmpty()) {
+                    Text(stringResource(id = R.string.search_label),
+                        color = Color.White.copy(alpha = 0.4f), fontSize = 14.sp)
+                }
+                BasicTextField(
+                    value = searchQuery,
+                    onValueChange = onSearchQueryChange,
+                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                    cursorBrush = SolidColor(Color(0xFF3B82F6)),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                    modifier = Modifier.fillMaxWidth().onFocusChanged { onSearchFocusChange(it.isFocused) }
+                )
+            }
+        }
+        Text(
+            text = title,
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+            letterSpacing = 0.5.sp
+        )
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun LayoutToggleButton(mode: CategoryLayoutMode, onClick: () -> Unit) {
+    val label = when (mode) {
+        CategoryLayoutMode.COMPACT -> "[=]"
+        CategoryLayoutMode.GRID -> "[#]"
+        CategoryLayoutMode.GROUPED -> "[S]"
+    }
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.size(44.dp),
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Black.copy(alpha = 0.5f),
+            focusedContainerColor = Color.White.copy(alpha = 0.15f)
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.15f)), shape = RoundedCornerShape(8.dp)),
+            focusedBorder = Border(BorderStroke(1.5.dp, Color.White), shape = RoundedCornerShape(8.dp))
+        )
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+            Text(label, fontSize = 14.sp, color = Color.White)
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sidebar
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun Sidebar(onNavigate: (Fragment) -> Unit) {
+    @OptIn(ExperimentalTvMaterial3Api::class)
+    @Composable
+    fun SidebarButton(iconRes: Int, label: String, onClick: () -> Unit) {
+        val interactionSource = remember { MutableInteractionSource() }
+        val isFocused by interactionSource.collectIsFocusedAsState()
+        Surface(
+            onClick = onClick,
+            modifier = Modifier.width(64.dp).wrapContentHeight(),
+            interactionSource = interactionSource,
+            shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(BorderStroke(0.dp, Color.Transparent), shape = RoundedCornerShape(8.dp)),
+                focusedBorder = Border(BorderStroke(0.dp, Color.Transparent), shape = RoundedCornerShape(8.dp))
+            ),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.0f)
+        ) {
+            Row(modifier = Modifier.wrapContentHeight()) {
+                Box(modifier = Modifier.width(3.dp).height(44.dp)
+                    .align(Alignment.CenterVertically)
+                    .background(if (isFocused) Color(0xFF3B82F6) else Color.Transparent,
+                        RoundedCornerShape(2.dp)))
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f).padding(vertical = 10.dp, horizontal = 2.dp)
+                ) {
+                    androidx.compose.material3.Icon(
+                        painter = painterResource(iconRes),
+                        contentDescription = label,
+                        modifier = Modifier.size(26.dp),
+                        tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.35f)
+                    )
+                    Text(label,
+                        fontSize = 10.sp,
+                        fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (isFocused) Color.White else Color.White.copy(alpha = 0.35f),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, letterSpacing = 0.5.sp)
+                }
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .width(72.dp)
+            .fillMaxHeight()
+            .background(Color.Black.copy(alpha = 0.4f))
+            .padding(vertical = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly
+    ) {
+        Surface(
+            onClick = { onNavigate(TvHomeComposeFragment()) },
+            shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(10.dp)),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = Color.Transparent,
+                focusedContainerColor = Color.White.copy(alpha = 0.1f)
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(
+                    BorderStroke(1.5.dp, Color.White.copy(alpha = 0.4f)),
+                    shape = RoundedCornerShape(10.dp))
+            ),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.sqlogo),
+                contentDescription = stringResource(R.string.home_menu_home),
+                modifier = Modifier.size(48.dp).padding(6.dp)
+            )
+        }
+        SidebarButton(R.drawable.ic_iptv, stringResource(R.string.home_menu_iptv))         {
+            onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.IPTV))
+        }
+        SidebarButton(R.drawable.ic_movies, stringResource(R.string.home_menu_movies))     {
+            onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.VOD))
+        }
+        SidebarButton(R.drawable.ic_series, stringResource(R.string.home_menu_series))     {
+            onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.SERIES))
+        }
+        SidebarButton(R.drawable.ic_search, stringResource(R.string.home_menu_search))     {
+            onNavigate(GlobalSearchFragment())
+        }
+        SidebarButton(R.drawable.ic_settings, stringResource(R.string.home_menu_settings)) {
+            onNavigate(SettingsTvComposeFragment())
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Content dispatcher -- picks compact / grid / grouped
+// -----------------------------------------------------------------------------
+
+@Composable
+private fun CategoryListContent(
+    mode: CategoryLayoutMode,
+    categories: List<CategoryItem>,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    focusRequester: FocusRequester,
+    favoriteIds: Set<String>,
+    onSelected: (String, String) -> Unit,
+    onFavoriteToggle: (CategoryItem) -> Unit,
+    onLockClick: (CategoryItem) -> Unit,
+    onHideClick: (CategoryItem) -> Unit,
+    portalId: String?,
+    cacheVersion: Int,
+    targetCategoryId: String? = null
+) {
+    when (mode) {
+        CategoryLayoutMode.COMPACT -> CompactList(
+            categories, contentType, viewModel, focusRequester,
+            favoriteIds, onSelected, onFavoriteToggle, onLockClick, onHideClick, portalId, cacheVersion,
+            targetCategoryId
+        )
+        CategoryLayoutMode.GRID -> GridLayout(
+            categories, contentType, viewModel, focusRequester,
+            favoriteIds, onSelected, onFavoriteToggle, onLockClick, onHideClick, portalId, cacheVersion
+        )
+        CategoryLayoutMode.GROUPED -> GroupedList(
+            categories, contentType, viewModel, focusRequester,
+            favoriteIds, onSelected, onFavoriteToggle, onLockClick, onHideClick, portalId, cacheVersion
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Layout 1: Compact list
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun CompactList(
+    categories: List<CategoryItem>,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    focusRequester: FocusRequester,
+    favoriteIds: Set<String>,
+    onSelected: (String, String) -> Unit,
+    onFavoriteToggle: (CategoryItem) -> Unit,
+    onLockClick: (CategoryItem) -> Unit,
+    onHideClick: (CategoryItem) -> Unit,
+    portalId: String?,
+    cacheVersion: Int,
+    targetCategoryId: String? = null
+) {
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    // Focus restore: a dedicated FocusRequester attached to the row whose id
+    // matches targetCategoryId. We scroll it into view (so the row is composed
+    // and exists), then request focus on THAT row specifically -- not the list
+    // -- which avoids the off-by-one where the list focused the row above.
+    val targetRowFocusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(targetCategoryId, categories) {
+        val id = targetCategoryId ?: return@LaunchedEffect
+        val index = categories.indexOfFirst { it.id == id }
+        if (index < 0) return@LaunchedEffect
+
+        // Bring the target row into view.
+        runCatching { listState.scrollToItem(index) }
+
+        // Wait until the row is actually composed + placed before focusing.
+        // A fixed delay() races composition on slow TV boxes: when the row
+        // isn't ready, requestFocus() throws, runCatching swallows it, and the
+        // TV focus engine falls back to a default item -- the "cursor jumps a
+        // few categories up" bug. Poll the layout per frame instead, with a
+        // bounded ceiling so we never hang.
+        var ready = false
+        var frames = 0
+        while (frames < 48) {                  // ~0.8s ceiling at 60fps
+            if (listState.layoutInfo.visibleItemsInfo.any { it.index == index }) {
+                ready = true
+                break
+            }
+            withFrameNanos { }
+            frames++
+        }
+        if (!ready) return@LaunchedEffect
+
+        // One settle frame so the row's focusRequester node is attached.
+        withFrameNanos { }
+        runCatching { targetRowFocusRequester.requestFocus() }
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.focusRequester(focusRequester),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        itemsIndexed(categories, key = { idx, item -> item.id.ifBlank { "cat_$idx" } }) { _, item ->
+            // Attach the restore focus-requester only to the row we're
+            // returning to; all other rows get an empty modifier.
+            val rowModifier = if (item.id == targetCategoryId)
+                Modifier.focusRequester(targetRowFocusRequester)
+            else
+                Modifier
+            CompactCategoryRow(
+                item = item.copy(isFavorite = item.id in favoriteIds),
+                contentType = contentType,
+                viewModel = viewModel,
+                portalId = portalId,
+                cacheVersion = cacheVersion,
+                onClick = { onSelected(item.id, item.name) },
+                onFavoriteClick = { onFavoriteToggle(item) },
+                onLockClick = { onLockClick(item) },
+                onHideClick = { onHideClick(item) },
+                rowModifier = rowModifier
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun CompactCategoryRow(
+    item: CategoryItem,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    portalId: String?,
+    cacheVersion: Int,
+    onClick: () -> Unit,
+    onFavoriteClick: () -> Unit,
+    onLockClick: () -> Unit = {},
+    onHideClick: () -> Unit = {},
+    rowModifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    val count by rememberCategoryCount(item.id, contentType, 0, viewModel, portalId)
+    val prefix = rememberPrefixInfo(item.name)
+
+    var starFocused by remember { mutableStateOf(false) }
+    var dotsFocused by remember { mutableStateOf(false) }
+    val rowFocused = isFocused || starFocused || dotsFocused
+
+    // Synthetic rows (Favourite Channels meta-entry) get no dots menu --
+    // the actions don't apply to a pseudo-category. Detect by id prefix
+    // so the same logic survives future synthetic entries we might add.
+    val isMetaRow = item.id == FAV_CHANNELS_ID
+    val menuActions = if (isMetaRow) emptyList<RowAction>() else listOf(
+        RowAction(
+            label = stringResource(R.string.menu_lock_with_pin),
+            onClick = onLockClick
+        ),
+        RowAction(
+            label = stringResource(R.string.menu_hide_category),
+            onClick = onHideClick
+        )
+    )
+
+    Row(
+        modifier = rowModifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (rowFocused) Color.Black.copy(alpha = 0.7f) else Color.Black.copy(alpha = 0.5f))
+            .border(
+                width = if (rowFocused) 2.dp else 1.dp,
+                color = if (rowFocused) prefix.accent else Color.White.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(6.dp)
+            ),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Accent bar
+        Box(modifier = Modifier.width(3.dp).fillMaxHeight()
+            .background(if (rowFocused) prefix.accent else prefix.accent.copy(alpha = 0.4f)))
+
+        // Main surface
+        Surface(
+            onClick = onClick,
+            modifier = Modifier.weight(1f).fillMaxHeight(),
+            interactionSource = interactionSource,
+            shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(0.dp)),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.0f, pressedScale = 0.98f),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(BorderStroke(0.dp, Color.Transparent))
+            )
+        ) {
+            Row(
+                modifier = Modifier.fillMaxSize().padding(start = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (prefix.prefix.isNotEmpty()) {
+                    Text(
+                        text = prefix.prefix, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                        color = prefix.accent,
+                        modifier = Modifier.clip(RoundedCornerShape(3.dp))
+                            .background(prefix.accent.copy(alpha = 0.12f))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Text(
+                    text = prefix.display,
+                    modifier = Modifier.weight(1f), fontSize = 14.sp,
+                    fontWeight = if (rowFocused) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (rowFocused) Color.White else Color(0xFFCBD5E1),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                CountAndLogos(count, item.id, contentType, rowFocused, prefix.accent)
+            }
+        }
+
+        // When the dots menu is present, the star gets square right-side
+        // corners and the menu takes the outer rounding. When the menu
+        // is suppressed (meta rows), the star keeps its rounded corners.
+        FavouriteStar(
+            isFavourite = item.isFavorite,
+            rowFocused = rowFocused,
+            onFocusChange = { starFocused = it },
+            onClick = onFavoriteClick,
+            cornerEnd = if (menuActions.isEmpty()) 6.dp else 0.dp
+        )
+        RowActionMenu(
+            items = menuActions,
+            onFocusChange = { dotsFocused = it },
+            cornerEnd = 6.dp,
+            tint = prefix.accent
+        )
+    }
+}
+
+@Composable
+private fun CountAndLogos(
+    count: String,
+    itemId: String,
+    contentType: ContentType,
+    rowFocused: Boolean,
+    accent: Color
+) {
+    val logos = rememberCategoryLogos(itemId, contentType)
+    Row(
+        modifier = Modifier.padding(end = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+// Only show the badge for a real positive count. "..." (still
+        // loading) and "0" (empty, or a synthetic/unknown category like the
+        // Favourite Channels meta-row whose count lives in its name) are
+        // both hidden so we never render a misleading "(0)".
+        val countN = count.toIntOrNull()
+        if (countN != null && countN > 0) {
+            Text(
+                text = "($countN)", fontSize = 12.sp,
+                color = if (rowFocused) accent else Color(0xFF64748B),
+                fontWeight = if (rowFocused) FontWeight.SemiBold else FontWeight.Normal
+            )
+        }
+        if (logos.isNotEmpty()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                logos.forEach { logoUrl ->
+                    AsyncImage(
+                        model = coil.request.ImageRequest.Builder(LocalContext.current)
+                            .data(logoUrl).size(80, 80).allowHardware(DeviceInfo.allowHardwareBitmaps).build(),
+                        contentDescription = null,
+                        modifier = Modifier.size(24.dp).clip(RoundedCornerShape(4.dp))
+                            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(4.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Layout 2: Grid
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun GridLayout(
+    categories: List<CategoryItem>,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    focusRequester: FocusRequester,
+    favoriteIds: Set<String>,
+    onSelected: (String, String) -> Unit,
+    onFavoriteToggle: (CategoryItem) -> Unit,
+    onLockClick: (CategoryItem) -> Unit,
+    onHideClick: (CategoryItem) -> Unit,
+    portalId: String?,
+    cacheVersion: Int
+) {
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        modifier = Modifier.focusRequester(focusRequester)
+            // canFocus=false on the grid container avoids beyond-bounds D-pad
+            // search ANRs on some TV remotes
+            .focusProperties { canFocus = false },
+        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        itemsIndexed(categories, key = { idx, item -> item.id.ifBlank { "cat_$idx" } }) { _, item ->
+            GridCategoryCard(
+                item = item.copy(isFavorite = item.id in favoriteIds),
+                contentType = contentType,
+                viewModel = viewModel,
+                portalId = portalId,
+                cacheVersion = cacheVersion,
+                onClick = { onSelected(item.id, item.name) },
+                onFavoriteClick = { onFavoriteToggle(item) },
+                onLockClick = { onLockClick(item) },
+                onHideClick = { onHideClick(item) }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun GridCategoryCard(
+    item: CategoryItem,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    portalId: String?,
+    cacheVersion: Int,          // <-- ADD THIS
+    onClick: () -> Unit,
+    onFavoriteClick: () -> Unit,
+    onLockClick: () -> Unit = {},
+    onHideClick: () -> Unit = {}
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    val count by rememberCategoryCount(item.id, contentType, 0, viewModel, portalId)
+    val prefix = rememberPrefixInfo(item.name)
+
+    var starFocused by remember { mutableStateOf(false) }
+    var dotsFocused by remember { mutableStateOf(false) }
+    val rowFocused = isFocused || starFocused || dotsFocused
+
+    val isMetaRow = item.id == FAV_CHANNELS_ID
+    val menuActions = if (isMetaRow) emptyList<RowAction>() else listOf(
+        RowAction(label = stringResource(R.string.menu_lock_with_pin), onClick = onLockClick),
+        RowAction(label = stringResource(R.string.menu_hide_category), onClick = onHideClick)
+    )
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(80.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (rowFocused) Color.Black.copy(alpha = 0.7f) else Color.Black.copy(alpha = 0.5f))
+            .border(
+                width = if (rowFocused) 1.5.dp else 1.dp,
+                color = if (rowFocused) prefix.accent else Color.White.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(8.dp)
+            )
+    ) {
+        Box(modifier = Modifier.width(4.dp).fillMaxHeight()
+            .clip(RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp))
+            .background(prefix.accent.copy(alpha = if (rowFocused) 1f else 0.5f)))
+
+        Surface(
+            onClick = onClick,
+            modifier = Modifier.weight(1f).fillMaxHeight(),
+            interactionSource = interactionSource,
+            shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(0.dp)),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.0f, pressedScale = 0.97f),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(BorderStroke(0.dp, Color.Transparent))
+            )
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                if (prefix.prefix.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = prefix.prefix, fontSize = 9.sp, fontWeight = FontWeight.Bold,
+                            color = prefix.accent,
+                            modifier = Modifier.clip(RoundedCornerShape(3.dp))
+                                .background(prefix.accent.copy(alpha = 0.15f))
+                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+                Text(
+                    text = prefix.display,
+                    fontSize = 13.sp,
+                    fontWeight = if (rowFocused) FontWeight.SemiBold else FontWeight.Medium,
+                    color = if (rowFocused) Color.White else Color(0xFFCBD5E1),
+                    maxLines = 2, overflow = TextOverflow.Ellipsis
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val logos = rememberCategoryLogos(item.id, contentType, maxLogos = 3)
+                    logos.forEach { logoUrl ->
+                        AsyncImage(
+                            model = coil.request.ImageRequest.Builder(LocalContext.current)
+                                .data(logoUrl).size(60, 60).allowHardware(DeviceInfo.allowHardwareBitmaps).build(),
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp).clip(RoundedCornerShape(3.dp))
+                                .border(1.dp, Color.Black.copy(alpha = 0.4f), RoundedCornerShape(3.dp)),
+                            contentScale = ContentScale.Crop
+                        )
+                    }
+                    val countN = count.toIntOrNull()
+                    if (countN != null && countN > 0) {
+                        Text(text = countN.toString(), fontSize = 11.sp,
+                            color = if (rowFocused) prefix.accent else Color(0xFF475569),
+                            fontWeight = FontWeight.Normal)
+                    }
+                }
+            }
+        }
+
+        FavouriteStar(
+            isFavourite = item.isFavorite,
+            rowFocused = rowFocused,
+            onFocusChange = { starFocused = it },
+            onClick = onFavoriteClick,
+            cornerEnd = if (menuActions.isEmpty()) 8.dp else 0.dp
+        )
+        RowActionMenu(
+            items = menuActions,
+            onFocusChange = { dotsFocused = it },
+            cornerEnd = 8.dp,
+            tint = prefix.accent
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Layout 3: Grouped
+// -----------------------------------------------------------------------------
+
+private sealed class ListEntry {
+    data class Header(val label: String, val accent: Color) : ListEntry()
+    data class Item(val category: CategoryItem) : ListEntry()
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun GroupedList(
+    categories: List<CategoryItem>,
+    contentType: ContentType,
+    viewModel: TvHomeViewModel,
+    focusRequester: FocusRequester,
+    favoriteIds: Set<String>,
+    onSelected: (String, String) -> Unit,
+    onFavoriteToggle: (CategoryItem) -> Unit,
+    onLockClick: (CategoryItem) -> Unit,
+    onHideClick: (CategoryItem) -> Unit,
+    portalId: String?,
+    cacheVersion: Int
+) {
+    val favLabel = stringResource(R.string.category_favorites)
+    val otherLabel = stringResource(R.string.category_other)
+    
+    val flatList = remember(categories, favoriteIds, favLabel, otherLabel) {
+        val favs = categories.filter { it.id in favoriteIds }
+        val rest = categories.filter { it.id !in favoriteIds }
+        val byPrefix = rest.groupBy { name ->
+            extractPrefix(name.name).ifEmpty { otherLabel }
+        }.toSortedMap()
+        buildList {
+            if (favs.isNotEmpty()) {
+                add(ListEntry.Header(favLabel, Color(0xFFFBBF24)))
+                favs.forEach { add(ListEntry.Item(it)) }
+            }
+            byPrefix.forEach { (prefix, items) ->
+                val accent = regionColors[prefix] ?: defaultAccent
+                add(ListEntry.Header(prefix, accent))
+                items.sortedBy { it.name }.forEach { add(ListEntry.Item(it)) }
+            }
+        }
+    }
+
+    LazyColumn(
+        modifier = Modifier.focusRequester(focusRequester),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        itemsIndexed(flatList, key = { i, entry ->
+            when (entry) {
+                is ListEntry.Header -> "h_${i}_${entry.label}"
+                is ListEntry.Item -> entry.category.id
+            }
+        }) { _, entry ->
+            when (entry) {
+                is ListEntry.Header -> GroupHeader(entry.label, entry.accent)
+                is ListEntry.Item -> CompactCategoryRow(
+                    item = entry.category.copy(isFavorite = entry.category.id in favoriteIds),
+                    contentType = contentType,
+                    viewModel = viewModel,
+                    portalId = portalId,
+                    cacheVersion = cacheVersion,
+                    onClick = { onSelected(entry.category.id, entry.category.name) },
+                    onFavoriteClick = { onFavoriteToggle(entry.category) },
+                    onLockClick = { onLockClick(entry.category) },
+                    onHideClick = { onHideClick(entry.category) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupHeader(label: String, accent: Color) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.width(3.dp).height(14.dp).background(accent, RoundedCornerShape(2.dp)))
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(text = label, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = accent, letterSpacing = 1.5.sp)
+        Spacer(modifier = Modifier.width(10.dp))
+        Box(modifier = Modifier.weight(1f).height(1.dp).background(accent.copy(alpha = 0.2f)))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Favourite star -- shared between compact + grid
+// -----------------------------------------------------------------------------
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun FavouriteStar(
+    isFavourite: Boolean,
+    rowFocused: Boolean,
+    onFocusChange: (Boolean) -> Unit,
+    onClick: () -> Unit,
+    cornerEnd: androidx.compose.ui.unit.Dp
+) {
+    var starFocused by remember { mutableStateOf(false) }
+    Surface(
+        onClick = onClick,
+        modifier = Modifier
+            .width(44.dp)
+            .fillMaxHeight()
+            .onFocusChanged {
+                starFocused = it.isFocused
+                onFocusChange(it.isFocused)
+            },
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(topEnd = cornerEnd, bottomEnd = cornerEnd)),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.0f),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = Color(0xFFFBBF24).copy(alpha = 0.15f)
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(0.dp, Color.Transparent)),
+            focusedBorder = Border(BorderStroke(0.dp, Color.Transparent))
+        )
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+            Text(
+                text = if (isFavourite) stringResource(R.string.star_icon) else "+",
+                fontSize = 16.sp,
+                color = when {
+                    isFavourite -> Color(0xFFFBBF24)
+                    starFocused -> Color(0xFFFBBF24).copy(alpha = 0.8f)
+                    rowFocused -> Color.White.copy(alpha = 0.4f)
+                    else -> Color.White.copy(alpha = 0.15f)
+                }
+            )
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Loading / error / empty states
+// -----------------------------------------------------------------------------
+
+@Composable
+private fun LoadingState() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(
+                color = Color.White, strokeWidth = 3.dp,
+                modifier = Modifier.size(48.dp)
+            )
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(stringResource(R.string.loading_categories),
+                color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+@Composable
+private fun ErrorState(message: String) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.5f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+                .padding(32.dp)
+        ) {
+            Text("[!]", fontSize = 36.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(message, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+@Composable
+private fun EmptyState() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.5f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+                .padding(40.dp)
+        ) {
+            Text("[?]", fontSize = 36.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(stringResource(id = R.string.no_categories_found),
+                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PortalRepository convenience
+// -----------------------------------------------------------------------------
+
+private fun PortalRepository.getActivePortal(): Portal? =
+    getPortals().find { it.id == getActivePortalId() }
