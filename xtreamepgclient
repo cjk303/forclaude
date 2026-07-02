@@ -1,0 +1,189 @@
+package com.kam.magplayer.epg
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * EPG client for Xtream Codes IPTV servers.
+ *
+ * Xtream Codes exposes two EPG endpoints:
+ *  - get_short_epg: fast, returns ~4 events (now + next), used for the channel list preview
+ *  - get_simple_data_table: full day EPG for a single channel, used when opening the player
+ *
+ * Stream IDs are extracted from the channel URL:
+ *   http://host:port/live/username/password/729.m3u8  →  streamId = "729"
+ *   http://host:port/live/username/password/729       →  streamId = "729"
+ */
+object XtreamEpgClient {
+
+    private const val TAG = "XTREAM_EPG"
+
+    /**
+     * Extracts the Xtream stream ID from a channel URL.
+     *
+     * Handles both formats:
+     *   http://host:port/live/user/pass/12345.m3u8  →  "12345"
+     *   http://host:port/live/user/pass/12345       →  "12345"
+     *
+     * Returns null if the URL doesn't match the expected pattern.
+     */
+    fun extractStreamId(url: String): String? {
+        return try {
+            val path = URL(url).path           // e.g. /live/user/pass/12345.m3u8
+            val last = path.trimEnd('/')
+                .substringAfterLast('/')
+                .substringBeforeLast('.')      // strip .m3u8 / .ts / .mp4 etc.
+            if (last.isNotEmpty() && last.all { it.isDigit() }) last else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Fetches short EPG (now + next few events) for a single channel.
+     * Used for the channel list mini-preview.
+     *
+     * @param baseUrl  e.g. "http://server:8880"
+     * @param username Xtream username
+     * @param password Xtream password
+     * @param streamId numeric stream ID extracted from channel URL
+     * @param limit    number of events to fetch (default 4 covers ~2 hours)
+     */
+    suspend fun getShortEpg(
+        baseUrl: String,
+        username: String,
+        password: String,
+        streamId: String,
+        limit: Int = 4
+    ): List<StalkerEpgEvent> = withContext(Dispatchers.IO) {
+
+        val url = "${baseUrl.trimEnd('/')}/player_api.php" +
+                "?username=$username&password=$password" +
+                "&action=get_short_epg&stream_id=$streamId&limit=$limit"
+
+        Log.d(TAG, "Short EPG: $url")
+
+        return@withContext try {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 11)")
+                connectTimeout = 5000
+                readTimeout    = 5000
+            }
+
+            val body = conn.inputStream.bufferedReader().readText()
+            parseShortEpg(body, streamId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Short EPG error for streamId=$streamId", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Fetches full EPG for a single channel (entire day).
+     * Used when the player opens to show the full programme guide.
+     */
+    suspend fun getFullEpg(
+        baseUrl: String,
+        username: String,
+        password: String,
+        streamId: String
+    ): List<StalkerEpgEvent> = withContext(Dispatchers.IO) {
+
+        val url = "${baseUrl.trimEnd('/')}/player_api.php" +
+                "?username=$username&password=$password" +
+                "&action=get_simple_data_table&stream_id=$streamId"
+
+        Log.d(TAG, "Full EPG: $url")
+
+        return@withContext try {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 11)")
+                connectTimeout = 8000
+                readTimeout    = 8000
+            }
+
+            val body = conn.inputStream.bufferedReader().readText()
+            parseFullEpg(body, streamId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Full EPG error for streamId=$streamId", e)
+            emptyList()
+        }
+    }
+
+    // ── Parsers ───────────────────────────────────────────────────────────────
+
+    private fun parseShortEpg(body: String, streamId: String): List<StalkerEpgEvent> {
+        return try {
+            val root = JSONObject(body)
+            val listings = root.optJSONArray("epg_listings") ?: return emptyList()
+            val events = mutableListOf<StalkerEpgEvent>()
+
+            for (i in 0 until listings.length()) {
+                val item = listings.getJSONObject(i)
+
+                val titleRaw = item.optString("title")
+                val title = decodeBase64Safe(titleRaw).ifBlank { titleRaw }
+
+                val descRaw = item.optString("description")
+                val desc = decodeBase64Safe(descRaw).ifBlank { descRaw }
+
+                val start = item.optString("start_timestamp").toLongOrNull()
+                    ?: item.optString("start").toLongOrNull()
+                    ?: continue
+                val end = item.optString("stop_timestamp").toLongOrNull()
+                    ?: item.optString("end").toLongOrNull()
+                    ?: continue
+
+                events.add(StalkerEpgEvent(title = title, description = desc, start = start, end = end))
+            }
+
+            Log.d(TAG, "Parsed ${events.size} short EPG events for streamId=$streamId")
+            events
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse short EPG for streamId=$streamId", e)
+            emptyList()
+        }
+    }
+
+    private fun parseFullEpg(body: String, streamId: String): List<StalkerEpgEvent> {
+        return try {
+            val root = JSONObject(body)
+            val listings = root.optJSONArray("epg_listings") ?: return emptyList()
+            val events = mutableListOf<StalkerEpgEvent>()
+
+            for (i in 0 until listings.length()) {
+                val item = listings.getJSONObject(i)
+                val title = decodeBase64Safe(item.optString("title"))
+                    .ifBlank { item.optString("title") }
+                val desc = decodeBase64Safe(item.optString("description"))
+                    .ifBlank { item.optString("description") }
+                val start = item.optString("start_timestamp").toLongOrNull()
+                    ?: item.optString("start").toLongOrNull()
+                    ?: continue
+                val end = item.optString("stop_timestamp").toLongOrNull()
+                    ?: item.optString("end").toLongOrNull()
+                    ?: continue
+
+                events.add(StalkerEpgEvent(title = title, description = desc, start = start, end = end))
+            }
+
+            Log.d(TAG, "Parsed ${events.size} full EPG events for streamId=$streamId")
+            events
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse full EPG for streamId=$streamId", e)
+            emptyList()
+        }
+    }
+
+    private fun decodeBase64Safe(encoded: String): String {
+        return try {
+            String(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT)).trim()
+        } catch (e: Exception) {
+            ""
+        }
+    }
+}
