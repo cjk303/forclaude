@@ -1,0 +1,498 @@
+package com.kam.magplayer.epg
+
+import android.util.Log
+import java.util.concurrent.ConcurrentHashMap
+import com.kam.magplayer.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object EpgRepository {
+
+    private val stalkerEvents = ConcurrentHashMap<String, List<StalkerEpgEvent>>()
+    private val xtreamEvents  = ConcurrentHashMap<String, List<StalkerEpgEvent>>()
+    private val xmltvEvents   = ConcurrentHashMap<String, List<XmlTvEvent>>()
+    private val xmltvByName   = ConcurrentHashMap<String, String>()
+    // Channel logos pulled from <channel><icon src=...> in the XMLTV (#4).
+    // Keyed by canonical lowercased channel id -- same key space as xmltvEvents.
+    // Used as a FALLBACK only when the M3U tvg-logo is blank.
+    private val xmltvIcons    = ConcurrentHashMap<String, String>()
+
+    // Manual per-channel EPG overrides for the ACTIVE portal: channel.id ->
+    // pinned xmltvEvents key. Scoped to the active portal exactly like
+    // xmltvEvents (cleared + repopulated on portal load via setOverrides),
+    // so a bare channelId key is enough -- no portalId needed at lookup time.
+    private val overrides     = ConcurrentHashMap<String, String>()
+
+    // ── Normalization ─────────────────────────────────────────────────────────
+
+    private fun normalizeName(name: String?): String {
+        if (name.isNullOrBlank()) return ""
+        var s = name.lowercase()
+        s = s.replace(Regex("^[a-z]{2,4}\\s*\\|\\s*"), "")
+        s = s.replace(Regex("\\s*[\\[(][^\\]\\)]*[\\]\\)]"), "")
+        s = s.replace(Regex("\\s+(fhd|uhd|4k|hd|sd|raw|\\+1)\\s*$"), "")
+        s = s.replace(Regex("[^a-z0-9]"), "")
+        return s
+    }
+
+    private fun normalizeId(id: String?): String {
+        if (id.isNullOrBlank()) return ""
+        return id.lowercase().replace(Regex("[^a-z0-9]"), "")
+    }
+
+    private fun xmltvShortName(xmltvKey: String): String {
+        val beforeDot = xmltvKey.substringBefore('.').lowercase()
+            .replace(Regex("[^a-z0-9]"), "")
+        return beforeDot.ifEmpty { normalizeId(xmltvKey) }
+    }
+
+    // ── Sort comparators (allocation-free) ─────────────────────────────────────
+    // a.start.compareTo(b.start) compiles to a primitive long compare (lcmp) --
+    // NO Long.valueOf boxing, unlike sortedBy { it.start } which boxes a Long on
+    // every comparison. On Shield-class XMLTV payloads (thousands of channels x
+    // many programmes) the boxed version was an O(N log N) allocation storm in
+    // putXmlTvMap, piling onto an already heap-starved process. Same sort order.
+
+    private val stalkerByStart = Comparator<StalkerEpgEvent> { a, b -> a.start.compareTo(b.start) }
+    private val xmlTvByStart   = Comparator<XmlTvEvent>      { a, b -> a.start.compareTo(b.start) }
+
+    // ── Stalker ───────────────────────────────────────────────────────────────
+
+    fun putStalkerEvents(channelId: String, events: List<StalkerEpgEvent>) {
+        // FIX: sort once at write time so getBestEpg reads are O(N) not O(N log N)
+        stalkerEvents[channelId] = events.sortedWith(stalkerByStart)
+        _stalkerEpgVersion.value++
+        Log.d("EPG_REPO", "putStalker[$channelId] = ${events.size} events")
+    }
+
+    fun getStalkerEvents(channelId: String?): List<StalkerEpgEvent> {
+        if (channelId.isNullOrBlank()) return emptyList()
+        return stalkerEvents[channelId] ?: emptyList()
+    }
+
+    fun getStalkerNow(channelId: String?): StalkerEpgEvent? {
+        val now = System.currentTimeMillis() / 1000
+        return getStalkerEvents(channelId).firstOrNull { now in it.start..it.end }
+    }
+
+    fun getStalkerNext(channelId: String?): StalkerEpgEvent? {
+        val now = System.currentTimeMillis() / 1000
+        return getStalkerEvents(channelId).firstOrNull { it.start > now }
+    }
+
+    // ── Xtream ────────────────────────────────────────────────────────────────
+
+    fun putXtreamEvents(streamId: String, events: List<StalkerEpgEvent>) {
+        // FIX: sort once at write time
+        xtreamEvents[streamId] = events.sortedWith(stalkerByStart)
+        _stalkerEpgVersion.value++
+    }
+
+    fun getXtreamEvents(streamId: String?): List<StalkerEpgEvent> {
+        if (streamId.isNullOrBlank()) return emptyList()
+        return xtreamEvents[streamId] ?: emptyList()
+    }
+
+    fun getXtreamNow(streamId: String?): StalkerEpgEvent? {
+        val now = System.currentTimeMillis() / 1000
+        return getXtreamEvents(streamId).firstOrNull { now in it.start..it.end }
+    }
+
+    fun getXtreamNext(streamId: String?): StalkerEpgEvent? {
+        val now = System.currentTimeMillis() / 1000
+        return getXtreamEvents(streamId).firstOrNull { it.start > now }
+    }
+
+    // ── XMLTV ─────────────────────────────────────────────────────────────────
+
+    fun getXmlTvEvents(xmltvId: String?): List<XmlTvEvent> {
+        if (xmltvId.isNullOrBlank()) return emptyList()
+        return xmltvEvents[xmltvId] ?: xmltvEvents[xmltvId.lowercase()] ?: emptyList()
+    }
+
+    fun getXmlTvNow(xmltvId: String?): XmlTvEvent? {
+        val nowMs = System.currentTimeMillis()
+        return getXmlTvEvents(xmltvId).firstOrNull { nowMs in it.start..it.end }
+    }
+
+    fun getXmlTvNext(xmltvId: String?): XmlTvEvent? {
+        val nowMs = System.currentTimeMillis()
+        return getXmlTvEvents(xmltvId).firstOrNull { it.start > nowMs }
+    }
+
+    private val _xmltvVersion = MutableStateFlow(0)
+    val xmltvVersion: StateFlow<Int> = _xmltvVersion.asStateFlow()
+
+    private val _stalkerEpgVersion = MutableStateFlow(0)
+    val stalkerEpgVersion: StateFlow<Int> = _stalkerEpgVersion.asStateFlow()
+
+    fun putXmlTvMap(map: Map<String, List<XmlTvEvent>>) {
+        xmltvEvents.clear()
+        // FIX: sort each channel's events once at write time
+        map.forEach { (key, events) ->
+            xmltvEvents[key] = events.sortedWith(xmlTvByStart)
+        }
+        _xmltvVersion.value++
+
+        val newNameMap = mutableMapOf<String, String>()
+
+        fun register(lookupKey: String, originalKey: String) {
+            if (lookupKey.isNotEmpty()) newNameMap.putIfAbsent(lookupKey, originalKey)
+        }
+
+        for (key in map.keys) {
+            register(key, key)
+            register(key.lowercase(), key)
+            register(normalizeId(key), key)
+            register(xmltvShortName(key), key)
+            register(normalizeName(key), key)
+            register(normalizeName(xmltvShortName(key)), key)
+        }
+        xmltvByName.clear()
+        xmltvByName.putAll(newNameMap)
+
+        Log.d("EPG_REPO", "putXmlTvMap: ${map.size} channels, ${newNameMap.size} lookup entries")
+        Log.d("EPG_REPO", "XMLTV sample keys: ${map.keys.take(10).toList()}")
+    }
+    fun putXmlTvIcons(map: Map<String, String>) {
+        xmltvIcons.clear()
+        xmltvIcons.putAll(map)
+        Log.d("EPG_REPO", "putXmlTvIcons: ${map.size} channel icons")
+    }
+
+    fun iconFor(channel: Channel): String? {
+        if (xmltvIcons.isEmpty()) return null
+
+        // 1. Direct id forms (exact tvg-id == xmltv id).
+        channel.xmltvId?.let { iconByKey(it) }?.let { return it }
+        channel.xmltv_id?.let { iconByKey(it) }?.let { return it }
+        if (channel.epgId.isNotBlank()) iconByKey(channel.epgId)?.let { return it }
+
+        // 2. Normalized name/id via the xmltvByName alias map -- the same
+        //    canonical-key resolution getXmlTvEventsForChannel uses, so a
+        //    channel that shows EPG text also resolves a logo. Needed for
+        //    sources like epg.ovh whose ids contain spaces ("tvp 1").
+        val normalizedName = normalizeName(channel.name)
+        if (normalizedName.isNotEmpty()) {
+            xmltvByName[normalizedName]?.let { key -> iconByKey(key)?.let { return it } }
+        }
+        val normalizedId = normalizeId(channel.name)
+        if (normalizedId.isNotEmpty()) {
+            xmltvByName[normalizedId]?.let { key -> iconByKey(key)?.let { return it } }
+        }
+        val nameNoNum = channel.name.trimEnd().replace(Regex("\\s+\\d+$"), "")
+        if (nameNoNum != channel.name) {
+            val n = normalizeName(nameNoNum)
+            if (n.isNotEmpty()) xmltvByName[n]?.let { key -> iconByKey(key)?.let { return it } }
+        }
+        if (channel.epgId.isNotBlank()) {
+            xmltvByName[xmltvShortName(channel.epgId)]?.let { key -> iconByKey(key)?.let { return it } }
+        }
+
+        return null
+    }
+
+    private fun iconByKey(key: String): String? =
+        xmltvIcons[key] ?: xmltvIcons[key.lowercase()]
+    fun hasXmlTvData(): Boolean = xmltvEvents.isNotEmpty()
+
+    /** All loaded XMLTV channel keys, sorted -- for the per-channel override picker. */
+    fun xmlTvKeys(): List<String> = xmltvEvents.keys.toList().sorted()
+
+// -- Per-channel overrides --------------------------------------------------
+
+    fun setOverrides(map: Map<String, String>) {
+        overrides.clear()
+        overrides.putAll(map)
+        _xmltvVersion.value++
+    }
+
+    fun setOverride(channelId: String, xmltvKey: String) {
+        overrides[channelId] = xmltvKey
+        _xmltvVersion.value++
+    }
+
+    fun clearOverride(channelId: String) {
+        overrides.remove(channelId)
+        _xmltvVersion.value++
+    }
+
+    fun clearOverrides() = overrides.clear()
+
+    /** Pinned XMLTV events for [channel] if a manual override is set AND the
+     *  pinned source key is currently loaded; null otherwise (caller then
+     *  falls through to normal auto-matching). */
+    private fun overrideEventsFor(channel: Channel): List<XmlTvEvent>? {
+        val pinnedKey = overrides[channel.id] ?: return null
+        val events = xmltvEvents[pinnedKey]
+        return if (events.isNullOrEmpty()) null else events
+    }
+
+    private fun wrapXmlTvEvent(e: XmlTvEvent?): StalkerEpgEvent? = e?.let {
+        StalkerEpgEvent(
+            title       = it.title,
+            description = it.desc.orEmpty(),
+            start       = it.start / 1000,
+            end         = it.end   / 1000
+        )
+    }
+
+    fun getXmlTvEventsForChannel(channel: Channel): List<XmlTvEvent> {
+        overrideEventsFor(channel)?.let { return it }
+        getXmlTvEvents(channel.xmltvId).takeIf { it.isNotEmpty() }?.let { return it }
+        getXmlTvEvents(channel.xmltv_id).takeIf { it.isNotEmpty() }?.let { return it }
+        getXmlTvEvents(channel.xmltv_id?.lowercase()).takeIf { it.isNotEmpty() }?.let { return it }
+        getXmlTvEvents(channel.epgId).takeIf { it.isNotEmpty() }?.let { return it }
+
+        val normalizedName = normalizeName(channel.name)
+        if (normalizedName.isNotEmpty()) {
+            val xmlKey = xmltvByName[normalizedName]
+            if (xmlKey != null) {
+                val events = xmltvEvents[xmlKey]
+                if (!events.isNullOrEmpty()) {
+                    Log.d("EPG_REPO", "XMLTV match via normalizeName: '${channel.name}' → '$normalizedName' → '$xmlKey'")
+                    return events
+                }
+            }
+        }
+
+        val normalizedId = normalizeId(channel.name)
+        if (normalizedId.isNotEmpty()) {
+            val xmlKey = xmltvByName[normalizedId]
+            if (xmlKey != null) {
+                val events = xmltvEvents[xmlKey]
+                if (!events.isNullOrEmpty()) {
+                    Log.d("EPG_REPO", "XMLTV match via normalizeId: '${channel.name}' → '$normalizedId' → '$xmlKey'")
+                    return events
+                }
+            }
+        }
+
+        val nameWithoutTrailingNumber = channel.name.trimEnd().replace(Regex("\\s+\\d+$"), "")
+        if (nameWithoutTrailingNumber != channel.name) {
+            val normNoNum = normalizeName(nameWithoutTrailingNumber)
+            if (normNoNum.isNotEmpty()) {
+                val xmlKey = xmltvByName[normNoNum]
+                if (xmlKey != null) {
+                    val events = xmltvEvents[xmlKey]
+                    if (!events.isNullOrEmpty()) {
+                        Log.d("EPG_REPO", "XMLTV match via strip-number: '${channel.name}' → '$normNoNum' → '$xmlKey'")
+                        return events
+                    }
+                }
+            }
+        }
+
+        if (!channel.epgId.isNullOrBlank()) {
+            val shortEpg = xmltvShortName(channel.epgId)
+            val xmlKey = xmltvByName[shortEpg]
+            if (xmlKey != null) {
+                val events = xmltvEvents[xmlKey]
+                if (!events.isNullOrEmpty()) {
+                    Log.d("EPG_REPO", "XMLTV match via epgId shortName: '${channel.epgId}' → '$shortEpg' → '$xmlKey'")
+                    return events
+                }
+            }
+        }
+
+        return emptyList()
+    }
+
+    // ── Unified lookup ────────────────────────────────────────────────────────
+    // FIX: all sortedBy calls removed — lists are pre-sorted at write time in
+    // putStalkerEvents, putXtreamEvents, and putXmlTvMap.
+    // getBestEpg is now O(N) firstOrNull scans on already-sorted lists.
+
+    fun getBestEpg(channel: Channel): Pair<StalkerEpgEvent?, StalkerEpgEvent?> {
+        val nowSec = System.currentTimeMillis() / 1000
+        val nowMs  = System.currentTimeMillis()
+
+        // 0. Manual per-channel override -- always wins over auto-matching.
+        overrideEventsFor(channel)?.let { events ->
+            val current = events.firstOrNull { it.start <= nowMs && nowMs < it.end }
+            val next    = events.firstOrNull { it.start >= (current?.end ?: nowMs) && it.start > nowMs }
+            val cw = wrapXmlTvEvent(current)
+            val nw = wrapXmlTvEvent(next)
+            if (cw != null || nw != null) {
+                Log.d("EPG_REPO", "getBestEpg[${channel.name}] -> OVERRIDE pinned")
+                return cw to nw
+            }
+        }
+
+        // 1. Xtream — list is pre-sorted by start
+        val streamId = XtreamEpgClient.extractStreamId(channel.cmd)
+        if (streamId != null) {
+            val events = getXtreamEvents(streamId)
+            if (events.isNotEmpty()) {
+                val current = events.firstOrNull { it.start <= nowSec && nowSec < it.end }
+                val next    = events.firstOrNull { it.start >= (current?.end ?: nowSec) && it.start > nowSec }
+                if (current != null || next != null) {
+                    Log.d("EPG_REPO", "getBestEpg[${channel.name}] → Xtream: ${current?.title}")
+                    return current to next
+                }
+            }
+        }
+
+        // 2. XMLTV — list is pre-sorted by start
+        val xmlEvents = getXmlTvEventsForChannel(channel)
+        if (xmlEvents.isNotEmpty()) {
+            val current = xmlEvents.firstOrNull { it.start <= nowMs && nowMs < it.end }
+            val next    = xmlEvents.firstOrNull { it.start >= (current?.end ?: nowMs) && it.start > nowMs }
+
+            fun wrap(e: XmlTvEvent?) = e?.let {
+                StalkerEpgEvent(
+                    title       = it.title,
+                    description = it.desc.orEmpty(),
+                    start       = it.start / 1000,
+                    end         = it.end   / 1000
+                )
+            }
+            val currentWrapped = wrap(current)
+            val nextWrapped    = wrap(next)
+            if (currentWrapped != null || nextWrapped != null) {
+                Log.d("EPG_REPO", "getBestEpg[${channel.name}] → XMLTV: now=${currentWrapped?.title} next=${nextWrapped?.title}")
+                return currentWrapped to nextWrapped
+            }
+        }
+
+        // 3. Stalker — list is pre-sorted by start
+        val stalkerKeys = listOfNotNull(
+            channel.id.toString(),
+            channel.realId,
+            channel.epgId
+        ).distinct()
+
+        for (key in stalkerKeys) {
+            val events = getStalkerEvents(key)
+            if (events.isEmpty()) continue
+            val current = events.firstOrNull { it.start <= nowSec && nowSec < it.end }
+            val next    = events.firstOrNull { it.start >= (current?.end ?: nowSec) && it.start > nowSec }
+            if (current != null || next != null) {
+                Log.d("EPG_REPO", "getBestEpg[${channel.name}] → Stalker[$key]: ${current?.title}")
+                return current to next
+            }
+        }
+
+        // 4. Nearest Stalker event fallback
+        for (key in stalkerKeys) {
+            val events = getStalkerEvents(key)
+            if (events.isNotEmpty()) {
+                val nearest = events.minByOrNull { kotlin.math.abs(it.start - nowSec) }
+                if (nearest != null) return null to nearest
+            }
+        }
+
+        Log.d("EPG_REPO", "getBestEpg MISS [${channel.name}] " +
+                "xmltvId='${channel.xmltvId}' xmltv_id='${channel.xmltv_id}' epgId='${channel.epgId}' " +
+                "normName='${normalizeName(channel.name)}' " +
+                "stalkerKeys=$stalkerKeys " +
+                "xmltvLoaded=${xmltvEvents.isNotEmpty()} stalkerLoaded=${stalkerEvents.isNotEmpty()}")
+
+        return null to null
+    }
+
+    /**
+     * Returns all EPG events for [channel] that overlap the time window
+     * [fromEpochSec, toEpochSec]. Used by the full EPG view to populate
+     * a per-channel timeline.
+     *
+     * Follows the same source priority as [getBestEpg]: Xtream → XMLTV →
+     * Stalker. Returns from the first source that has events overlapping
+     * the window. If a source's cache has events but none overlap the
+     * requested window, falls through to the next source.
+     *
+     * Returned list is sorted by start time ascending (the underlying
+     * lists are pre-sorted at write time, so filtering preserves order).
+     * All timestamps in seconds, even for XMLTV-sourced events (converted
+     * on the way out, same as getBestEpg).
+     *
+     * Window semantics: an event overlaps the window if
+     *   event.end > fromEpochSec  AND  event.start < toEpochSec
+     * This includes the live event (started before now, ends after) and
+     * any event that ends partly inside the window.
+     *
+     * Default window: 1 hour before now to 12 hours after — good shape
+     * for a "what's on tonight" view without bloating the list.
+     */
+    fun getEventsForChannel(
+        channel: Channel,
+        fromEpochSec: Long = System.currentTimeMillis() / 1000 - 3600L,
+        toEpochSec:   Long = System.currentTimeMillis() / 1000 + 12 * 3600L
+    ): List<StalkerEpgEvent> {
+
+        fun List<StalkerEpgEvent>.inWindow(): List<StalkerEpgEvent> =
+            filter { it.end > fromEpochSec && it.start < toEpochSec }
+
+        // 0. Manual per-channel override -- always wins.
+        overrideEventsFor(channel)?.let { xmlEvents ->
+            val fromMs = fromEpochSec * 1000L
+            val toMs   = toEpochSec   * 1000L
+            val filtered = xmlEvents.filter { it.end > fromMs && it.start < toMs }
+            if (filtered.isNotEmpty()) return filtered.mapNotNull { wrapXmlTvEvent(it) }
+        }
+
+        // 1. Xtream
+        val streamId = XtreamEpgClient.extractStreamId(channel.cmd)
+        if (streamId != null) {
+            val events = getXtreamEvents(streamId).inWindow()
+            if (events.isNotEmpty()) {
+                Log.d("EPG_REPO", "getEventsForChannel[${channel.name}] → Xtream: ${events.size} events")
+                return events
+            }
+        }
+
+        // 2. XMLTV (millisecond timestamps in source → convert to seconds on the way out)
+        val xmlEvents = getXmlTvEventsForChannel(channel)
+        if (xmlEvents.isNotEmpty()) {
+            val fromMs = fromEpochSec * 1000L
+            val toMs   = toEpochSec   * 1000L
+            val filtered = xmlEvents.filter { it.end > fromMs && it.start < toMs }
+            if (filtered.isNotEmpty()) {
+                Log.d("EPG_REPO", "getEventsForChannel[${channel.name}] → XMLTV: ${filtered.size} events")
+                return filtered.map { e ->
+                    StalkerEpgEvent(
+                        title       = e.title,
+                        description = e.desc.orEmpty(),
+                        start       = e.start / 1000,
+                        end         = e.end   / 1000
+                    )
+                }
+            }
+        }
+
+        // 3. Stalker
+        val stalkerKeys = listOfNotNull(
+            channel.id.toString(),
+            channel.realId,
+            channel.epgId
+        ).distinct()
+        for (key in stalkerKeys) {
+            val events = getStalkerEvents(key).inWindow()
+            if (events.isNotEmpty()) {
+                Log.d("EPG_REPO", "getEventsForChannel[${channel.name}] → Stalker[$key]: ${events.size} events")
+                return events
+            }
+        }
+
+        Log.d("EPG_REPO", "getEventsForChannel MISS [${channel.name}] window=[$fromEpochSec..$toEpochSec]")
+        return emptyList()
+    }
+
+    // ── Cache management ──────────────────────────────────────────────────────
+
+    fun clearXtreamEvents() = xtreamEvents.clear()
+
+    var lastEpgLoadAttemptMs: Long = 0L
+
+    fun clearStalkerEvents() = stalkerEvents.clear()
+
+    fun clearAll() {
+        stalkerEvents.clear()
+        xtreamEvents.clear()
+        xmltvEvents.clear()
+        xmltvByName.clear()
+        xmltvIcons.clear()
+        overrides.clear()
+    }
+}
