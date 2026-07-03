@@ -1,0 +1,2115 @@
+package com.kam.magplayer
+
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.util.Log
+import android.view.LayoutInflater
+import coil.imageLoader
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Divider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.lifecycleScope
+import androidx.tv.material3.*
+import coil.compose.AsyncImage
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
+
+// ============================================================================
+// SECTION 1 -- DOMAIN MODELS & CACHES
+// ============================================================================
+
+sealed interface StatsViewState {
+    object Loading : StatsViewState
+    object NoPortal : StatsViewState
+    data class Success(val stats: PortalStats) : StatsViewState
+}
+
+data class PortalStats(
+    val name: String? = null,
+    val isOnline: Boolean = false,
+    val iptvCategoryCount: Int = 0,
+    val movieCategoryCount: Int = 0,
+    val seriesCategoryCount: Int = 0,
+    val errorMessage: String? = null
+)
+
+data class ContinueWatchingItem(
+    val vodItem: VodItem,
+    val percentage: Int,
+    val timePosition: String
+)
+
+/**
+ * Cross-field-consistent cache: stores portalId, stats, and timestamp as a single
+ * atomic unit. Previous version used three separate @Volatile fields and could
+ * publish torn reads to the Main thread (e.g. portalId already updated but stats
+ * still showing the old portal's data).
+ */
+object PortalStatsCache {
+    private const val CACHE_DURATION_MS = 5 * 60 * 1000L
+
+    private data class Entry(val portalId: String, val stats: PortalStats, val timestamp: Long)
+    private val ref = java.util.concurrent.atomic.AtomicReference<Entry?>(null)
+
+    fun get(portalId: String): PortalStats? {
+        val entry = ref.get() ?: return null
+        if (entry.portalId != portalId) return null
+        if (System.currentTimeMillis() - entry.timestamp >= CACHE_DURATION_MS) return null
+        if (!entry.stats.isOnline || entry.stats.iptvCategoryCount == 0) return null
+        return entry.stats
+    }
+
+    fun put(portalId: String, stats: PortalStats) {
+        ref.set(Entry(portalId, stats, System.currentTimeMillis()))
+    }
+
+    fun invalidate() { ref.set(null) }
+}
+
+// ============================================================================
+// SECTION 2 -- REGION INFERENCE
+//
+// Uses the app language the user explicitly set in LanguageSettingsScreen,
+// falling back to the system locale. Zero permission, zero network, zero Play
+// policy risk. The user's chosen language reflects content preference better
+// than IP geolocation would.
+// ============================================================================
+
+private val LANGUAGE_TO_REGION = mapOf(
+    "pl" to "PL", "de" to "DE", "fr" to "FR", "it" to "IT", "es" to "ES",
+    "nl" to "NL", "pt" to "PT", "ru" to "RU", "uk" to "UK", "ar" to "ARAB",
+    "tr" to "TR", "cs" to "CZ", "cz" to "CZ", "sk" to "SK", "hu" to "HU",
+    "ro" to "RO", "bg" to "BG", "el" to "GR", "gr" to "GR", "sv" to "SE",
+    "no" to "NO", "nb" to "NO", "nn" to "NO", "da" to "DK", "fi" to "FI",
+    "sr" to "RS", "hr" to "HR", "hi" to "IN", "zh" to "CN", "ja" to "JP",
+    "ko" to "KR", "th" to "TH"
+)
+
+private fun inferRegionFromLocale(): String {
+    val appLocales = AppCompatDelegate.getApplicationLocales()
+    val appTag = if (!appLocales.isEmpty) appLocales[0]?.language else null
+    val tag = appTag?.ifBlank { null } ?: Locale.getDefault().language
+    return LANGUAGE_TO_REGION[tag.lowercase()] ?: "EN"
+}
+
+private fun extractItemPrefix(name: String): String {
+    val pipeIdx = name.indexOf('|')
+    return if (pipeIdx > 0) name.substring(0, pipeIdx).trim().uppercase() else ""
+}
+
+private fun regionScore(name: String, userRegion: String): Int {
+    val prefix = extractItemPrefix(name)
+    return when {
+        prefix == userRegion -> 2
+        prefix == "EN" || prefix == "US" || prefix == "UK" -> 1
+        prefix.isEmpty() -> 1
+        else -> 0
+    }
+}
+
+private fun sortByRegion(items: List<VodItem>, userRegion: String): List<VodItem> =
+    items.sortedByDescending { regionScore(it.name, userRegion) }
+
+// ============================================================================
+// SECTION 3 -- DISPLAY HELPERS
+// ============================================================================
+
+/**
+ * Strip an IPTV prefix like "PL|" or "DE -" from a display name so the user
+ * sees the human-readable title in the UI. Centralised so the heuristics
+ * stay consistent across HeroBanner, LandscapeContentCard, LiveChannelCard,
+ * and FavCategoryChip.
+ */
+internal fun stripContentPrefix(name: String): String {
+    val pipeIdx = name.indexOf('|')
+    return when {
+        pipeIdx > 0 -> name.substring(pipeIdx + 1).trim()
+        name.length > 4 && name[2] == ' ' && name[3] == '-' && name[4] == ' ' ->
+            name.substring(5).trim()
+        name.length > 5 && name[3] == ' ' && name[4] == '-' && name[5] == ' ' ->
+            name.substring(6).trim()
+        else -> name
+    }
+}
+
+private fun formatPlaybackTime(ms: Long): String {
+    val sec = (ms / 1000) % 60
+    val min = (ms / (1000 * 60)) % 60
+    val hr = ms / (1000 * 60 * 60)
+    return if (hr > 0) String.format("%d:%02d:%02d", hr, min, sec)
+    else String.format("%02d:%02d", min, sec)
+}
+
+// ============================================================================
+// SECTION 4 -- UI STATE
+//
+// Single immutable snapshot of everything the home screen renders. The
+// ViewModel updates it atomically via StateFlow; the composable becomes a pure
+// renderer with no scattered remember{} state for orchestration concerns.
+// (Per-card animation state like focus/scale stays in the composables.)
+// ============================================================================
+
+data class HomeUiState(
+    val statsState: StatsViewState = StatsViewState.Loading,
+    val continueWatchingItems: List<ContinueWatchingItem> = emptyList(),
+    val isLoadingRecommendations: Boolean = false,
+    val allPortals: List<Portal> = emptyList(),
+    val activePortalId: String = "",
+    val favouriteCategories: List<Pair<String, String>> = emptyList(),
+    val recentChannels: List<Channel> = emptyList(),
+    val favoriteChannels: List<Channel> = emptyList(),
+    val isFetchingForNewPortal: Boolean = false,
+    val newPortalFetchDone: Boolean = false
+) {
+    val hasNothingToShow: Boolean
+        get() = continueWatchingItems.isEmpty() &&
+                recentChannels.isEmpty() &&
+                favoriteChannels.isEmpty() &&
+                favouriteCategories.isEmpty() &&
+                allPortals.isNotEmpty()
+}
+
+// ============================================================================
+// SECTION 5 -- PORTAL DATA LOADER
+//
+// Pure suspend functions, one entry point per portal type. Each returns a
+// Result that the ViewModel folds into HomeUiState. No Compose, no
+// LaunchedEffect, no main-thread surprises -- testable in isolation.
+// ============================================================================
+
+internal class PortalDataLoader(
+    private val context: Context,
+    private val viewModel: TvHomeViewModel
+) {
+    data class StatsAndItems(
+        val stats: PortalStats,
+        val items: List<ContinueWatchingItem>
+    )
+
+    // ------------------------------------------------------------------------
+    // Recommendation visibility filter (#1a)
+    //
+    // Categories the user hid via the dots-menu "Hide" -- or excluded via the
+    // keyword filter -- must not feed the home "Recommended" row. Built fresh
+    // per call so a freshly-hidden category takes effect on the next home
+    // refresh (the repo caches internally and this loader can outlive a hide).
+    // ------------------------------------------------------------------------
+    private fun categoryVisibilityPredicate(): (String) -> Boolean {
+        val repo = CategoryFilterRepository(context)
+        return { title -> repo.shouldShowCategory(title) }
+    }
+
+    /**
+     * Loads recent channels and favourite channels from local storage for a
+     * given portal. Always disk-only -- safe to call as soon as the portal is
+     * known, before any network handshake completes.
+     */
+    suspend fun loadLocalChannels(portal: Portal): Pair<List<Channel>, List<Channel>> =
+        withContext(Dispatchers.IO) {
+            val historyKey = portal.id.ifBlank { portal.macAddress }
+            val recent = HistoryRepository(context).getRecentlyWatched(historyKey).take(20)
+            val favs = FavoriteChannelsRepository(context).getFavoriteChannels(portal.id)
+            recent to favs
+        }
+
+    /**
+     * Pre-warm Coil's memory cache for visible channel logos so the first
+     * render is hit-cached and doesn't flash placeholder colours.
+     */
+    suspend fun prewarmLogos(channels: List<Channel>) = withContext(Dispatchers.IO) {
+        val urls = channels.mapNotNull { it.logo?.takeIf { l -> l.startsWith("http") } }
+            .distinct().take(20)
+        val loader = context.imageLoader          // <-- Coil singleton, shared with AsyncImage/coil.load
+        urls.forEach { url ->
+            val req = ImageRequest.Builder(context).data(url).size(240, 160)
+                .allowHardware(DeviceInfo.allowHardwareBitmaps)
+                .memoryCachePolicy(CachePolicy.ENABLED)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .build()
+            loader.enqueue(req)
+        }
+    }
+
+    /**
+     * Resolves favourite categories. Returns immediately if the portal cache
+     * has genres; otherwise waits (up to 10 s) for the parallel handshake to
+     * fill the cache.
+     */
+    suspend fun loadFavouriteCategories(portal: Portal): List<Pair<String, String>> =
+        withContext(Dispatchers.IO) {
+            val mac = portal.macAddress
+            val favIds = FavoriteRepository(context).getFavoriteCategories(mac, ContentType.IPTV)
+            if (favIds.isEmpty()) return@withContext emptyList()
+
+            val cache = PortalCache.get(portal.id)
+
+            // Suspend-await pattern: poll the cache until it's populated, then
+            // map to (id, title) pairs. The poll is cheap (500 ms) and bounded.
+            // Caller can cancel cleanly via coroutine scope.
+            val deadline = System.currentTimeMillis() + 10_000
+            while (cache.genres.isEmpty() && System.currentTimeMillis() < deadline) {
+                delay(500)
+            }
+            cache.genres.filter { it.id in favIds }.map { it.id to it.title }
+        }
+
+    // ------------------------------------------------------------------------
+    // M3U
+    // ------------------------------------------------------------------------
+
+    suspend fun loadM3u(portal: Portal, userRegion: String): StatsAndItems =
+        withContext(Dispatchers.IO) {
+            val cache = PortalCache.get(portal.id)
+            val url = portal.effectiveUrl
+
+            // Step 1: ensure M3U meta (genres + categories) is loaded
+            if (!cache.m3uLoaded) {
+                val meta = M3uCache.loadMeta(context, url)
+                if (meta != null) {
+                    cache.genres.clear()
+                    cache.genres.addAll(meta.genres)
+                    cache.vodCategories.clear()
+                    cache.vodCategories.addAll(meta.vodCategories)
+                    cache.seriesCategories.clear()
+                    cache.seriesCategories.addAll(meta.seriesCategories)
+                    cache.m3uLoaded = true
+                } else {
+                    cache.m3uLoadMutex.lock()
+                    try {
+                        if (!cache.m3uLoaded) {
+                            val result = M3uClient().load(url, context)
+                            M3uGenreRepository.populateCache(cache, result.channels)
+                            M3uCache.saveCategories(context, url,
+                                cache.genres, cache.vodCategories, cache.seriesCategories)
+                            cache.m3uLoaded = true
+                        }
+                    } catch (e: Exception) {
+                        Log.e("PortalDataLoader", "M3U load failed", e)
+                        cache.m3uLastError = e.message ?: e.javaClass.simpleName
+                    } finally {
+                        cache.m3uLoadMutex.unlock()
+                    }
+                }
+            }
+
+            val stats = PortalStats(
+                name = portal.name,
+                isOnline = cache.m3uLoaded,
+                iptvCategoryCount = (cache.genres.size - 1).coerceAtLeast(0),
+                movieCategoryCount = (cache.vodCategories.size - 1).coerceAtLeast(0),
+                seriesCategoryCount = (cache.seriesCategories.size - 1).coerceAtLeast(0),
+                errorMessage = if (!cache.m3uLoaded) cache.m3uLastError else null
+            )
+
+            // Step 2: build continue-watching items
+            val items = try {
+                val watchProgressRepo = WatchProgressRepository(context)
+                val allProgress = watchProgressRepo.getAllProgress()
+
+                // #1a: drop hidden/filtered categories from the recommendation
+                // pool. For M3U the maps are shared with the watched lookup, so
+                // a watched item in a category you've hidden also won't surface
+                // in continue-watching -- an acceptable, intuitive tradeoff.
+                val showCat = categoryVisibilityPredicate()
+                val hiddenVodCatIds = cache.vodCategories
+                    .filterNot { showCat(it.title) }.map { it.id }.toSet()
+                val hiddenSeriesCatIds = cache.seriesCategories
+                    .filterNot { showCat(it.title) }.map { it.id }.toSet()
+
+                var vodById = cache.vodPagesByCategory
+                    .filterKeys { it !in hiddenVodCatIds }
+                    .values.flatMap { it.values.flatten() }.distinctBy { it.id }.associateBy { it.id }
+                var seriesById = cache.seriesPagesByCategory
+                    .filterKeys { it !in hiddenSeriesCatIds }
+                    .values.flatMap { it.values.flatten() }.distinctBy { it.id }.associateBy { it.id }
+
+                if (vodById.isEmpty() && seriesById.isEmpty() && M3uCache.isFresh(context, url)) {
+                    val allChannels = M3uClient().loadFromStream(M3uCache.rawFile(context, url).inputStream())
+                    val vodChannels = allChannels.filter {
+                        M3uContentType.detect(it.category, it.cmd) == ContentType.VOD && showCat(it.category)
+                    }
+                    val seriesChannels = allChannels.filter {
+                        M3uContentType.detect(it.category, it.cmd) == ContentType.SERIES && showCat(it.category)
+                    }
+                    vodById = vodChannels.map { ch ->
+                        VodItem(id = ch.id, name = ch.name, poster = ch.logo,
+                            description = "", year = "", cmd = ch.cmd, isSeries = false, isMovie = true)
+                    }.associateBy { it.id }
+                    seriesById = seriesChannels.map { ch ->
+                        VodItem(id = ch.id, name = ch.name, poster = ch.logo,
+                            description = "", year = "", cmd = ch.cmd, isSeries = true, isMovie = false)
+                    }.associateBy { it.id }
+                }
+
+                val allItemsById = vodById + seriesById
+                val watched = allProgress.entries
+                    .filter { it.value in 1..99 }
+                    .sortedByDescending { it.value }
+                    .take(10)
+                    .mapNotNull { (key, pct) ->
+                        val item = allItemsById[key] ?: return@mapNotNull null
+                        val progress = watchProgressRepo.getProgress(key)
+                        val pos = progress?.first ?: 0L
+                        ContinueWatchingItem(item, pct, formatPlaybackTime(pos))
+                    }
+                val watchedIds = watched.map { it.vodItem.id }.toSet()
+
+                val recommendations = sortByRegion(
+                    allItemsById.values.filter { it.id !in watchedIds }.shuffled().take(30),
+                    userRegion
+                ).take((10 - watched.size).coerceAtLeast(0))
+                    .map { ContinueWatchingItem(it, 0, "") }
+
+                (watched + recommendations).take(10)
+            } catch (e: Exception) {
+                Log.e("PortalDataLoader", "M3U recommendations failed", e)
+                emptyList()
+            }
+
+            StatsAndItems(stats, items)
+        }
+
+    // ------------------------------------------------------------------------
+    // Xtream
+    // ------------------------------------------------------------------------
+
+    /** Returns stats only -- items are loaded separately via [loadXtreamItems]. */
+    suspend fun loadXtreamStats(portal: Portal): PortalStats = withContext(Dispatchers.IO) {
+        val cache = PortalCache.get(portal.id)
+        try {
+            withTimeout(15_000) {
+                val client = XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                if (cache.genres.isEmpty()) {
+                    cache.genres.addAll(client.getLiveCategories().map { StalkerGenre(it.id, it.title, "") })
+                }
+                if (cache.vodCategories.isEmpty()) cache.vodCategories.addAll(client.getVodCategories())
+                if (cache.seriesCategories.isEmpty()) cache.seriesCategories.addAll(client.getSeriesCategories())
+                val stats = PortalStats(
+                    name = portal.name, isOnline = true,
+                    iptvCategoryCount = cache.genres.size,
+                    movieCategoryCount = cache.vodCategories.size,
+                    seriesCategoryCount = cache.seriesCategories.size
+                )
+                PortalStatsCache.put(portal.id, stats)
+                stats
+            }
+        } catch (e: Exception) {
+            Log.e("PortalDataLoader", "Xtream stats failed: " + e.message)
+            PortalStats(portal.name, false)
+        }
+    }
+
+    suspend fun loadXtreamItems(portal: Portal, userRegion: String): List<ContinueWatchingItem> =
+        withContext(Dispatchers.IO) {
+            try {
+                withTimeout(15_000) {
+                    val client = XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                    val cache = PortalCache.get(portal.id)
+                    val cats = if (cache.vodCategories.isNotEmpty()) cache.vodCategories
+                    else client.getVodCategories().also { cache.vodCategories.addAll(it) }
+
+                    // #1a: skip categories the user has hidden/filtered out.
+                    val showCat = categoryVisibilityPredicate()
+                    val pool = mutableListOf<VodItem>()
+                    cats.filter { showCat(it.title) }.take(3).forEach { cat ->
+                        if (pool.size >= 30) return@forEach
+                        try { pool.addAll(client.getVodStreams(cat.id).take(10)) }
+                        catch (e: Exception) { /* skip category */ }
+                    }
+                    sortByRegion(pool.shuffled(), userRegion).take(10)
+                        .map { ContinueWatchingItem(it, 0, "") }
+                }
+            } catch (e: Exception) {
+                Log.e("PortalDataLoader", "Xtream recommendations failed: " + e.message)
+                emptyList()
+            }
+        }
+
+    // ------------------------------------------------------------------------
+    // Stalker
+    // ------------------------------------------------------------------------
+
+    /** Fast stats from in-memory cache, or null if we need a network call. */
+    fun stalkerQuickStats(portal: Portal): PortalStats? {
+        val cache = PortalCache.get(portal.id)
+        if (cache.genres.isEmpty() ||
+            cache.vodCategories.isEmpty() ||
+            cache.seriesCategories.isEmpty()) {
+            return PortalStatsCache.get(portal.id)
+        }
+        return PortalStats(
+            name = portal.name, isOnline = true,
+            iptvCategoryCount = cache.genres.size,
+            movieCategoryCount = cache.vodCategories.size,
+            seriesCategoryCount = cache.seriesCategories.size
+        ).also { PortalStatsCache.put(portal.id, it) }
+    }
+
+    suspend fun loadStalkerStats(portal: Portal): PortalStats = withContext(Dispatchers.IO) {
+        val cache = PortalCache.get(portal.id)
+        try {
+            withTimeout(15_000) {
+                if (cache.genres.isNotEmpty() &&
+                    cache.vodCategories.isNotEmpty() &&
+                    cache.seriesCategories.isNotEmpty()) {
+                    return@withTimeout PortalStats(
+                        name = portal.name, isOnline = true,
+                        iptvCategoryCount = cache.genres.size,
+                        movieCategoryCount = cache.vodCategories.size,
+                        seriesCategoryCount = cache.seriesCategories.size
+                    )
+                }
+                val stalkerClient = viewModel.getStalkerClient(portal.effectiveUrl, portal.macAddress)
+                val vodClient = viewModel.getVodClient(portal.effectiveUrl, portal.macAddress)
+                stalkerClient.handshake(force = false)
+
+                val iptvCount = if (cache.genres.isNotEmpty()) cache.genres.size
+                else { val g = stalkerClient.getGenres(); cache.genres.addAll(g); g.size }
+                val movieCount = if (cache.vodCategories.isNotEmpty()) cache.vodCategories.size
+                else { val c = vodClient.getVodCategories(); cache.vodCategories.addAll(c); c.size }
+                val seriesCount = if (cache.seriesCategories.isNotEmpty()) cache.seriesCategories.size
+                else { val c = vodClient.getSeriesCategories(); cache.seriesCategories.addAll(c); c.size }
+
+                PortalStats(
+                    name = portal.name, isOnline = true,
+                    iptvCategoryCount = iptvCount,
+                    movieCategoryCount = movieCount,
+                    seriesCategoryCount = seriesCount
+                ).also { PortalStatsCache.put(portal.id, it) }
+            }
+        } catch (e: Exception) {
+            if (e !is TimeoutCancellationException &&
+                e.message?.contains("composition", ignoreCase = true) != true) {
+                Log.e("PortalDataLoader", "Stalker stats failed", e)
+            }
+            PortalStats(portal.name, false)
+        }
+    }
+
+    suspend fun loadStalkerItems(portal: Portal, userRegion: String): List<ContinueWatchingItem> {
+        // Show hero immediately from any in-memory cache so the banner is
+        // never blank during a transient network failure.
+        val quickVod = withContext(Dispatchers.Default) {
+            val cache = PortalCache.get(portal.id)
+            // #1a: exclude cached pages whose category is hidden/filtered out.
+            val showCat = categoryVisibilityPredicate()
+            val hiddenCatIds = cache.vodCategories
+                .filterNot { showCat(it.title) }.map { it.id }.toSet()
+            cache.vodPagesByCategory
+                .filterKeys { it !in hiddenCatIds }
+                .values
+                .flatMap { it.values.flatten() }
+                .filter { !it.poster.isNullOrBlank() }
+                .shuffled().take(5)
+                .map { ContinueWatchingItem(it, 0, "") }
+        }
+
+        return try {
+            withTimeout(8_000) { loadStalkerItemsInner(portal, userRegion) }
+        } catch (e: TimeoutCancellationException) {
+            Log.w("PortalDataLoader", "Recommendations timed out (slow portal)")
+            quickVod
+        } catch (e: java.net.SocketException) {
+            Log.w("PortalDataLoader", "Connection reset, retrying in 2 s")
+            delay(2000)
+            runCatching {
+                val vodClient = viewModel.getVodClient(portal.effectiveUrl, portal.macAddress)
+                loadQuickRecommendations(vodClient, userRegion)
+            }.getOrElse { quickVod }
+        } catch (e: Exception) {
+            val msg = e.message ?: ""
+            if (!msg.contains("composition", ignoreCase = true) &&
+                !msg.contains("coroutine scope", ignoreCase = true) &&
+                !msg.contains("CancellationException", ignoreCase = true)) {
+                Log.e("PortalDataLoader", "Failed to load continue watching", e)
+            }
+            quickVod
+        }
+    }
+
+    private suspend fun loadStalkerItemsInner(
+        portal: Portal,
+        userRegion: String
+    ): List<ContinueWatchingItem> = withContext(Dispatchers.IO) {
+        val watchProgressRepo = WatchProgressRepository(context)
+        val allProgress = watchProgressRepo.getAllProgress()
+        val vodClient = viewModel.getVodClient(portal.effectiveUrl, portal.macAddress)
+
+        val watchedVideoIds = allProgress.entries
+            .filter { it.value in 1..99 }
+            .sortedByDescending { it.value }
+            .take(10).map { it.key }
+        val parentSeriesIds = watchProgressRepo.getParentSeriesIds(watchedVideoIds)
+        val combinedIds = (watchedVideoIds + parentSeriesIds).toSet()
+
+        if (combinedIds.isEmpty()) {
+            return@withContext loadQuickRecommendationsWithRetry(vodClient, userRegion)
+        }
+
+        val movieCats = vodClient.getVodCategories()
+        val seriesCats = vodClient.getSeriesCategories()
+        val watchedItems = collectWatchedItems(
+            movieCats, vodClient, combinedIds, allProgress, watchProgressRepo,
+            watchedVideoIds, parentSeriesIds
+        )
+        val finalWatched = watchedItems.sortedByDescending { it.percentage }.take(5)
+
+        // #1a: recommendations only draw from visible (non-hidden) categories.
+        // Watched items above stay unfiltered -- the user explicitly watched
+        // them, so hiding a category shouldn't drop continue-watching.
+        val showCat = categoryVisibilityPredicate()
+        val recommendations = if (finalWatched.size < 8) {
+            loadRecommendations(
+                vodClient,
+                movieCats.filter { showCat(it.title) },
+                seriesCats.filter { showCat(it.title) },
+                finalWatched, 8 - finalWatched.size, userRegion
+            )
+        } else emptyList()
+
+        (finalWatched + recommendations).take(10)
+    }
+
+    private suspend fun collectWatchedItems(
+        movieCats: List<VodCategory>,
+        vodClient: VodClient,
+        combinedIds: Set<String>,
+        allProgress: Map<String, Int>,
+        watchProgressRepo: WatchProgressRepository,
+        watchedVideoIds: List<String>,
+        parentSeriesIds: Set<String>
+    ): MutableList<ContinueWatchingItem> {
+        val watchedItems = mutableListOf<ContinueWatchingItem>()
+        for (cat in movieCats.take(2)) {
+            if (watchedItems.size >= 5) break
+            try {
+                vodClient.getVodItems(cat.id, 1).items.forEach { item ->
+                    if (item.id in combinedIds) {
+                        val pct = allProgress[item.id] ?: return@forEach
+                        val (pos, _) = watchProgressRepo.getProgress(item.id) ?: return@forEach
+                        watchedItems.add(ContinueWatchingItem(item, pct, formatPlaybackTime(pos)))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("PortalDataLoader", "Error in movie category " + cat.id, e)
+            }
+        }
+        if (watchedItems.size < 5 && parentSeriesIds.isNotEmpty()) {
+            val seriesMetadata = watchProgressRepo.getAllSeriesMetadata(watchedVideoIds)
+            seriesMetadata.forEach { (seriesId, metadata) ->
+                if (watchedItems.size >= 5) return@forEach
+                val (seriesName, seriesPoster, percentage) = metadata
+                val episodeId = watchedVideoIds.firstOrNull {
+                    watchProgressRepo.getParentSeriesId(it) == seriesId
+                }
+                val (position, _) = if (episodeId != null)
+                    watchProgressRepo.getProgress(episodeId) ?: (0L to 0L)
+                else (0L to 0L)
+                watchedItems.add(ContinueWatchingItem(
+                    VodItem(id = seriesId, name = seriesName, description = "",
+                        poster = seriesPoster, cmd = "", isSeries = true, isMovie = false),
+                    percentage, formatPlaybackTime(position)
+                ))
+            }
+        }
+        return watchedItems
+    }
+
+    private suspend fun loadQuickRecommendationsWithRetry(
+        vodClient: VodClient,
+        userRegion: String
+    ): List<ContinueWatchingItem> = try {
+        loadQuickRecommendations(vodClient, userRegion)
+    } catch (e: java.net.SocketException) {
+        Log.w("PortalDataLoader", "Connection reset on recommendations, retrying")
+        delay(1500)
+        runCatching { loadQuickRecommendations(vodClient, userRegion) }.getOrDefault(emptyList())
+    }
+
+    private suspend fun loadQuickRecommendations(
+        vodClient: VodClient,
+        userRegion: String
+    ): List<ContinueWatchingItem> = try {
+        val showCat = categoryVisibilityPredicate()   // #1a
+        val movieCats = vodClient.getVodCategories().filter { showCat(it.title) }
+        val pool = mutableListOf<VodItem>()
+        movieCats.take(2).forEach { cat ->
+            try { pool.addAll(vodClient.getVodItems(cat.id, 1).items.take(6)) }
+            catch (e: Exception) { Log.e("PortalDataLoader", "Error loading recommendations", e) }
+        }
+        sortByRegion(pool.shuffled(), userRegion).take(8)
+            .map { ContinueWatchingItem(it, 0, "") }
+    } catch (e: Exception) {
+        Log.w("PortalDataLoader", "Error in quick recommendations", e)
+        emptyList()
+    }
+
+    private suspend fun loadRecommendations(
+        vodClient: VodClient,
+        movieCats: List<VodCategory>,
+        seriesCats: List<VodCategory>,
+        exclude: List<ContinueWatchingItem>,
+        count: Int,
+        userRegion: String
+    ): List<ContinueWatchingItem> {
+        val pool = mutableListOf<VodItem>()
+        return try {
+            movieCats.take(2).forEach { cat ->
+                if (pool.size >= count * 4) return@forEach
+                try { pool.addAll(vodClient.getVodItems(cat.id, 1).items.take(6)) }
+                catch (e: Exception) { Log.w("PortalDataLoader", "movie cat error", e) }
+            }
+            seriesCats.take(1).forEach { cat ->
+                if (pool.size >= count * 4) return@forEach
+                try { pool.addAll(vodClient.getSeriesList(cat.id, 1).items.take(6)) }
+                catch (e: Exception) { Log.w("PortalDataLoader", "series cat error", e) }
+            }
+            sortByRegion(
+                pool.filter { vod -> exclude.none { it.vodItem.id == vod.id } }.shuffled(),
+                userRegion
+            ).take(count).map { ContinueWatchingItem(it, 0, "") }
+        } catch (e: Exception) {
+            Log.w("PortalDataLoader", "Error in recommendations", e)
+            emptyList()
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // New-portal first-channel fetch -- used when nothing else surfaced any
+    // content so the Live TV row isn't empty for first-time portal users.
+    // ------------------------------------------------------------------------
+
+    suspend fun fetchFirstChannelsForNewPortal(portal: Portal): List<Channel> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val cache = PortalCache.get(portal.id)
+                when {
+                    portal.isXtream -> {
+                        val client = XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                        val cats = client.getLiveCategories()
+                        if (cats.isEmpty()) return@runCatching emptyList<Channel>()
+                        val firstCat = cats.first()
+                        val ch = client.getLiveStreams(firstCat.id).take(20)
+                        cache.getOrPutChannelPage(firstCat.id)[1] = ch
+                        if (cache.genres.isEmpty())
+                            cache.genres.addAll(cats.map { StalkerGenre(it.id, it.title, "") })
+                        ch
+                    }
+                    portal.isM3U -> {
+                        cache.channelPagesByGenre.values.firstOrNull()
+                            ?.values?.flatten()?.take(20) ?: emptyList()
+                    }
+                    else -> {
+                        val client = StalkerClient(portal.effectiveUrl, portal.macAddress)
+                        val genres = if (cache.genres.isNotEmpty()) cache.genres
+                        else client.getGenres().also { cache.genres.addAll(it) }
+                        if (genres.isEmpty()) return@runCatching emptyList<Channel>()
+                        val firstGenre = genres.first()
+                        val result = client.getChannelsPage(firstGenre.id, page = 1, limit = 20)
+                        cache.getOrPutChannelPage(firstGenre.id)[1] = result.channels
+                        result.channels
+                    }
+                }
+            }.getOrElse { emptyList() }
+        }
+}
+class TvHomeComposeFragment : Fragment() {
+
+    private val viewModel: TvHomeViewModel by viewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View = ComposeView(requireContext()).apply {
+        setContent {
+            MaterialTheme {
+                HomeScreen(
+                    viewModel = viewModel,
+                    fragment = this@TvHomeComposeFragment
+                )
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d("TvHomeComposeFragment", "onResume")
+    }
+
+    /** Top-level sidebar destination -- resets the back stack to one section. */
+    fun navigateSection(fragment: Fragment) = tvGoTopLevel(fragment)
+
+    fun navigateToCategories(contentType: ContentType) =
+        tvGoTopLevel(CategoryBrowseComposeFragment.newInstance(contentType))
+
+    /** Drill into a screen within the current section (stacks normally). */
+    fun navigateDrillDown(fragment: Fragment) = tvGoDrillDown(fragment)
+
+    fun playVodMovie(item: VodItem) {
+        if (item.isSeries) {
+            navigateDrillDown(SeriesBrowseFragment.newInstance(item))
+            return
+        }
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val activePortal = PortalRepository(requireContext()).getActivePortal() ?: return@launch
+                val (videoUrl, _) = if (activePortal.isM3U || activePortal.isXtream) {
+                    item.cmd to null
+                } else {
+                    viewModel.getVodClient(activePortal.effectiveUrl, activePortal.macAddress)
+                        .getVodFile(item).cmd to null
+                }
+                withContext(Dispatchers.Main) {
+                    startActivity(Intent(requireContext(), PlayerActivity::class.java).apply {
+                        putExtra("VIDEO_URL", videoUrl)
+                        putExtra("VIDEO_ID", item.id)
+                        putExtra("TITLE", item.name)
+                        putExtra("PORTAL_URL", activePortal.effectiveUrl)
+                        putExtra("MAC_ADDRESS", activePortal.macAddress)
+                    })
+                }
+            } catch (e: Exception) {
+                Log.e("TvHomeComposeFragment", "Failed to play VOD movie", e)
+            }
+        }
+    }
+
+    fun playChannelFromFavourites(
+        channel: Channel,
+        favourites: List<Channel>,
+        categoryName: String
+    ) {
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val portal = PortalRepository(requireContext()).getActivePortal() ?: return@launch
+            val cache = PortalCache.get(portal.id)
+            val recentKey = "__fav_channels__"
+            cache.channelPagesByGenre.getOrPut(recentKey) { mutableMapOf() }[1] = favourites
+            val idx = favourites.indexOfFirst { it.id == channel.id }.coerceAtLeast(0)
+            // Filter genres through parental controls before passing to player.
+            // Without this, the player's category rail would let the user
+            // navigate into a category that's locked on the home screen --
+            // a back-door into parentally-locked content.
+            val parentalRepo = ParentalControlsRepository(requireContext())
+            val visibleGenres = ParentalFilter.filterGenres(
+                cache.genres.toList(), portal.id, parentalRepo
+            )
+            withContext(Dispatchers.Main) {
+                startActivity(Intent(requireContext(), PlayerActivity::class.java).apply {
+                    putExtra("PORTAL_URL", portal.effectiveUrl)
+                    putExtra("MAC_ADDRESS", portal.macAddress)
+                    putExtra("PORTAL_ID", portal.id)
+                    putExtra("CURRENT_INDEX", idx)
+                    putExtra("CONTENT_TYPE", ContentType.IPTV.name)
+                    putExtra("CATEGORY_ID", recentKey)
+                    putExtra("CATEGORY_NAME", categoryName)
+                    putStringArrayListExtra("CAT_IDS", ArrayList(visibleGenres.map { it.id }))
+                    putStringArrayListExtra("CAT_NAMES", ArrayList(visibleGenres.map { it.title }))
+                    if (portal.isXtream) {
+                        putExtra("IS_XTREAM", true)
+                        putExtra("XTREAM_USERNAME", portal.username)
+                        putExtra("XTREAM_PASSWORD", portal.password)
+                    }
+                })
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SECTION 7 -- COMPOSABLE: HomeScreen
+//
+// Pure renderer. Reads HomeUiState from the ViewModel, dispatches user actions
+// back. No business logic, no Dispatchers.IO, no caches -- just layout.
+// ============================================================================
+
+@Composable
+private fun HomeScreen(
+    viewModel: TvHomeViewModel,
+    fragment: TvHomeComposeFragment
+) {
+    val context = LocalContext.current
+    val ui by viewModel.homeUiState.collectAsState()
+    val clockText by viewModel.clockText.collectAsState()
+
+    // Parental controls plumbing. The repo is cheap (just wraps
+    // SharedPreferences) so creating it per composition is fine. The
+    // filtered favourite-categories list is keyed on a coarse time tick
+    // so the unlock-window expiry naturally re-evaluates without forcing
+    // a recompose elsewhere.
+    val parentalRepo = remember { ParentalControlsRepository(context) }
+    val visibleFavCategories = remember(
+        ui.favouriteCategories,
+        ui.activePortalId,
+        System.currentTimeMillis() / 60_000L
+    ) {
+        if (ui.activePortalId.isNotBlank() &&
+            parentalRepo.isEnabled(ui.activePortalId) &&
+            !ParentalSession.isUnlocked(ui.activePortalId)) {
+            val locked = parentalRepo.getLockedCategoryIds(ui.activePortalId)
+            ui.favouriteCategories.filterNot { (id, _) -> id in locked }
+        } else ui.favouriteCategories
+    }
+
+    // Boot the ViewModel once. It will then re-load whenever the lifecycle
+    // signals a resume (see DisposableEffect below).
+    LaunchedEffect(Unit) { viewModel.initialize(context) }
+
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) viewModel.onResume(context)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Refresh and portal-switch handlers for the top bar. Refresh uses the
+    // shared PortalReloader (same path as TV settings + phone) and then
+    // re-triggers the ViewModel's onResume so the UI picks up fresh data.
+    var isRefreshing by remember { mutableStateOf(false) }
+    var infoCardItem by remember { mutableStateOf<VodItem?>(null) }
+    androidx.activity.compose.BackHandler(enabled = infoCardItem != null) {
+        infoCardItem = null
+    }
+    val coroutineScope = rememberCoroutineScope()
+    val onRefresh: () -> Unit = {
+        val active = ui.allPortals.firstOrNull { it.id == ui.activePortalId }
+        if (active != null && !isRefreshing) {
+            isRefreshing = true
+            Toast.makeText(context, "Refreshing " + active.name + "...", Toast.LENGTH_SHORT).show()
+            coroutineScope.launch {
+                try {
+                    val result = PortalReloader.reload(context, active)
+                    viewModel.onResume(context)
+                    Toast.makeText(
+                        context, result.message,
+                        if (result.success) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                    ).show()
+                } finally {
+                    isRefreshing = false
+                }
+            }
+        }
+    }
+    val onPortalSwitch: (Portal) -> Unit = { portal ->
+        coroutineScope.launch {
+            PortalRepository(context).setActivePortalId(portal.id)
+            PortalStatsCache.invalidate()
+            viewModel.onResume(context)
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Background image + dim
+        Image(
+            painter = painterResource(id = R.drawable.tvbackground),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop
+        )
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)))
+
+        // Sidebar + content. Top bar is PINNED above the scrolling area --
+        // it used to be inside the verticalScroll Column, which meant any
+        // D-pad focus auto-scroll pushed it off the top of the screen.
+        // Now it stays anchored and the cards row also keeps its bottom
+        // breathing room.
+        Row(modifier = Modifier.fillMaxSize()) {
+            Sidebar(fragment = fragment)
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .zIndex(1f)
+                    .padding(start = 80.dp, end = 32.dp, top = 16.dp)
+            ) {
+                // Pinned top bar -- refresh, portal switcher, status, clock.
+                // Lives outside the scroll so focus shifts can't hide it.
+                TopBar(
+                    statsState = ui.statsState,
+                    clockText = clockText,
+                    allPortals = ui.allPortals,
+                    activePortalId = ui.activePortalId,
+                    isRefreshing = isRefreshing,
+                    onRefresh = onRefresh,
+                    onPortalSwitch = onPortalSwitch
+                )
+
+// Scrollable content area below the top bar.
+                val scrollState = rememberScrollState()
+
+                // First-load shimmer gate. Fail-safe by construction: it shows
+                // only while a portal is selected, NO content of any kind has
+                // arrived yet, and none of the existing status cards apply.
+                // The instant any content lands -- or the screen resolves to a
+                // status card -- the condition flips false on its own, so the
+                // skeleton can never get stuck on screen.
+                val activePortalName = ui.allPortals
+                    .firstOrNull { it.id == ui.activePortalId }?.name ?: ""
+                val hasAnyHomeContent = ui.continueWatchingItems.isNotEmpty() ||
+                        ui.favoriteChannels.isNotEmpty() ||
+                        visibleFavCategories.isNotEmpty()
+                val showingStatusCard = ui.allPortals.isEmpty() ||
+                        (ui.hasNothingToShow &&
+                                (ui.isFetchingForNewPortal || ui.newPortalFetchDone))
+                val showHomeSkeleton = ui.allPortals.isNotEmpty() &&
+                        !showingStatusCard &&
+                        !hasAnyHomeContent
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState)
+                        .graphicsLayer { clip = false }
+                        .padding(bottom = 32.dp)
+                ) {
+                    when {
+                        ui.allPortals.isEmpty() -> NoPortalCard(fragment)
+                        ui.hasNothingToShow && ui.isFetchingForNewPortal -> NewPortalSpinner()
+                        ui.hasNothingToShow && ui.newPortalFetchDone -> NothingToShowCard(fragment)
+                    }
+
+                    if (showHomeSkeleton) {
+                        HomeLoadingSkeleton(portalName = activePortalName)
+                    } else if (ui.allPortals.isNotEmpty()) {
+                        HeroSection(
+                            heroItem = ui.continueWatchingItems.firstOrNull(),
+                            onPlay = { it ->
+                                val v = it.vodItem
+                                if (v.isSeries) fragment.playVodMovie(v) else infoCardItem = v
+                            }
+                        )
+                        Spacer(Modifier.height(24.dp))
+                        ContinueWatchingSection(
+                            items = ui.continueWatchingItems,
+                            isLoading = ui.isLoadingRecommendations,
+                            onClick = { it ->
+                                val v = it.vodItem
+                                if (v.isSeries) fragment.playVodMovie(v) else infoCardItem = v
+                            }
+                        )
+                        FavouriteChannelsSection(
+                            favourites = ui.favoriteChannels,
+                            onClick = { ch, label ->
+                                fragment.playChannelFromFavourites(ch, ui.favoriteChannels, label)
+                            }
+                        )
+                        FavouriteCategoriesSection(
+                            categories = visibleFavCategories,
+                            onCategoryClick = { id, name ->
+                                fragment.navigateDrillDown(ContentBrowseComposeFragment.newInstance(
+                                    ContentType.IPTV, id, name
+                                ))
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        infoCardItem?.let { card ->
+            VodInfoCard(
+                item = card,
+                onPlay = {
+                    infoCardItem = null
+                    fragment.playVodMovie(card)
+                },
+                onBack = { infoCardItem = null }
+            )
+        }
+    }
+}
+
+@Composable
+private fun Sidebar(fragment: TvHomeComposeFragment) {
+    @OptIn(ExperimentalTvMaterial3Api::class)
+    Column(
+        modifier = Modifier
+            .width(72.dp)
+            .fillMaxHeight()
+            .background(Color.Black.copy(alpha = 0.4f))
+            .padding(vertical = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceEvenly
+    ) {
+        Surface(
+            onClick = { fragment.navigateSection(TvHomeComposeFragment()) },
+            shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(10.dp)),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = Color.Transparent,
+                focusedContainerColor = Color.White.copy(alpha = 0.1f)
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(
+                    BorderStroke(1.5.dp, Color.White.copy(alpha = 0.4f)),
+                    shape = RoundedCornerShape(10.dp))
+            ),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+        ) {
+            Image(
+                painter = painterResource(R.drawable.sqlogo),
+                contentDescription = stringResource(R.string.home_menu_home),
+                modifier = Modifier.size(48.dp).padding(6.dp)
+            )
+        }
+        SidebarButton(R.drawable.ic_iptv, stringResource(R.string.home_menu_iptv))         { fragment.navigateToCategories(ContentType.IPTV) }
+        SidebarButton(R.drawable.ic_movies, stringResource(R.string.home_menu_movies))     { fragment.navigateToCategories(ContentType.VOD) }
+        SidebarButton(R.drawable.ic_series, stringResource(R.string.home_menu_series))     { fragment.navigateToCategories(ContentType.SERIES) }
+        SidebarButton(R.drawable.ic_search, stringResource(R.string.home_menu_search))     { fragment.navigateSection(GlobalSearchFragment()) }
+        SidebarButton(R.drawable.ic_settings, stringResource(R.string.home_menu_settings)) { fragment.navigateSection(SettingsTvComposeFragment()) }
+    }
+}
+
+// ============================================================================
+// TopBar -- now includes a refresh icon (left of portal name) and the portal
+// name is a dropdown trigger when more than one portal exists.
+// ============================================================================
+
+@Composable
+private fun TopBar(
+    statsState: StatsViewState,
+    clockText: String,
+    allPortals: List<Portal>,
+    activePortalId: String,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
+    onPortalSwitch: (Portal) -> Unit
+) {
+    var showPortalSwitcher by remember { mutableStateOf(false) }
+    val canSwitchPortals = allPortals.size > 1
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 12.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (statsState is StatsViewState.Success) {
+            val s = statsState.stats
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Refresh icon -- spins while reloading the active portal.
+                TopBarRefreshButton(isRefreshing = isRefreshing, onClick = onRefresh)
+
+                // Portal name -- clickable when multiple portals exist.
+                // Hosts a DropdownMenu that auto-positions below the button.
+                Box {
+                    PortalNameButton(
+                        portalName = s.name ?: "",
+                        canSwitch = canSwitchPortals,
+                        isExpanded = showPortalSwitcher,
+                        onClick = {
+                            if (canSwitchPortals) showPortalSwitcher = !showPortalSwitcher
+                        }
+                    )
+                    DropdownMenu(
+                        expanded = showPortalSwitcher,
+                        onDismissRequest = { showPortalSwitcher = false },
+                        modifier = Modifier.background(Color(0xFF0F1923))
+                    ) {
+                        Column(
+                            modifier = Modifier.width(260.dp).padding(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                "Switch portal",
+                                color = Color(0xFF3B82F6),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.5.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                            Divider(color = Color(0xFF3B82F6).copy(alpha = 0.3f))
+                            Spacer(Modifier.height(2.dp))
+                            allPortals.forEach { portal ->
+                                PortalSwitcherRow(
+                                    portal = portal,
+                                    isActive = portal.id == activePortalId,
+                                    onClick = {
+                                        showPortalSwitcher = false
+                                        onPortalSwitch(portal)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Text(stringResource(R.string.bullet_separator),
+                    color = if (s.isOnline) Color(0xFF4CAF50) else Color(0xFFF44336),
+                    fontSize = 12.sp)
+                Text(
+                    stringResource(if (s.isOnline) R.string.stats_status_online else R.string.stats_status_offline),
+                    color = if (s.isOnline) Color(0xFF4CAF50) else Color(0xFFF44336),
+                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                )
+                if (clockText.isNotBlank()) {
+                    Spacer(Modifier.width(8.dp))
+                    ClockText(clockText)
+                }
+            }
+        } else if (clockText.isNotBlank()) {
+            ClockText(clockText)
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun TopBarRefreshButton(isRefreshing: Boolean, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+
+    val rotation = if (isRefreshing) {
+        val transition = rememberInfiniteTransition(label = "home-topbar-refresh")
+        val angle by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(900, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "home-topbar-angle"
+        )
+        angle
+    } else 0f
+
+    Surface(
+        onClick = { if (!isRefreshing) onClick() },
+        interactionSource = interactionSource,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(14.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (isRefreshing) Color(0xFF3B82F6).copy(alpha = 0.15f) else Color.Transparent,
+            focusedContainerColor = Color.White.copy(alpha = 0.12f)
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(0.dp, Color.Transparent)),
+            focusedBorder = Border(BorderStroke(1.5.dp, Color(0xFF3B82F6)), shape = RoundedCornerShape(14.dp))
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.1f)
+    ) {
+        Box(
+            modifier = Modifier.size(28.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_refresh),
+                contentDescription = "Refresh",
+                modifier = Modifier.size(16.dp).rotate(rotation),
+                tint = when {
+                    isRefreshing -> Color(0xFF3B82F6)
+                    isFocused -> Color.White
+                    else -> Color.White.copy(alpha = 0.7f)
+                }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun PortalNameButton(
+    portalName: String,
+    canSwitch: Boolean,
+    isExpanded: Boolean,
+    onClick: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+
+    Surface(
+        onClick = onClick,
+        interactionSource = interactionSource,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(6.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = if (canSwitch) Color.White.copy(alpha = 0.1f) else Color.Transparent
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(0.dp, Color.Transparent)),
+            focusedBorder = if (canSwitch)
+                Border(BorderStroke(1.dp, Color(0xFF3B82F6)), shape = RoundedCornerShape(6.dp))
+            else
+                Border(BorderStroke(0.dp, Color.Transparent))
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = if (canSwitch) 1.03f else 1f)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                portalName,
+                color = if (isFocused && canSwitch) Color.White else Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (canSwitch) {
+                Text(
+                    if (isExpanded) stringResource(R.string.arrow_up) else stringResource(R.string.arrow_down),
+                    color = if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.5f),
+                    fontSize = 9.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ClockText(text: String) {
+    Text(text,
+        color = Color.White.copy(alpha = 0.7f),
+        fontSize = 20.sp, fontWeight = FontWeight.Light, letterSpacing = 1.sp)
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun NoPortalCard(fragment: TvHomeComposeFragment) {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(top = 48.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(24.dp),
+            modifier = Modifier.fillMaxWidth(0.7f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color.Black.copy(alpha = 0.6f))
+                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(16.dp))
+                .padding(40.dp)
+        ) {
+            Text(stringResource(R.string.home_no_portal_icon), fontSize = 48.sp)
+            Text(stringResource(R.string.no_portals_configured),
+                color = Color.White, fontSize = 16.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center, lineHeight = 24.sp)
+            Surface(
+                onClick = { fragment.navigateSection(SettingsTvComposeFragment()) },
+                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+                colors = ClickableSurfaceDefaults.colors(
+                    containerColor = Color(0xFF3B82F6),
+                    focusedContainerColor = Color(0xFF2563EB)
+                ),
+                border = ClickableSurfaceDefaults.border(
+                    border = Border(BorderStroke(0.dp, Color.Transparent)),
+                    focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(8.dp))
+                )
+            ) {
+                Text(stringResource(R.string.home_portal_settings_button),
+                    color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 32.dp, vertical = 12.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewPortalSpinner() {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(top = 60.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = Color.White.copy(alpha = 0.5f),
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(36.dp)
+            )
+            Text(stringResource(R.string.home_loading_channels),
+                color = Color(0xFF64748B), fontSize = 14.sp)
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun NothingToShowCard(fragment: TvHomeComposeFragment) {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(top = 40.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+            modifier = Modifier.fillMaxWidth(0.6f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color.Black.copy(alpha = 0.55f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(16.dp))
+                .padding(36.dp)
+        ) {
+            Text(stringResource(R.string.home_nothing_to_show_icon), fontSize = 40.sp)
+            Text(stringResource(R.string.home_nothing_to_show_title),
+                color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text(stringResource(R.string.home_nothing_to_show_subtitle),
+                color = Color(0xFF94A3B8), fontSize = 13.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center, lineHeight = 20.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                PrimaryActionButton(stringResource(R.string.home_browse_iptv)) {
+                    fragment.navigateToCategories(ContentType.IPTV)
+                }
+                SecondaryActionButton(stringResource(R.string.home_browse_movies)) {
+                    fragment.navigateToCategories(ContentType.VOD)
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun PrimaryActionButton(label: String, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color(0xFF3B82F6),
+            focusedContainerColor = Color(0xFF2563EB)
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(0.dp, Color.Transparent)),
+            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(8.dp))
+        )
+    ) {
+        Text(label,
+            color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 11.dp))
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun SecondaryActionButton(label: String, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.White.copy(alpha = 0.08f),
+            focusedContainerColor = Color.White.copy(alpha = 0.18f)
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.15f))),
+            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(8.dp))
+        )
+    ) {
+        Text(label,
+            color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 11.dp))
+    }
+}
+
+@Composable
+private fun HeroSection(heroItem: ContinueWatchingItem?, onPlay: (ContinueWatchingItem) -> Unit) {
+    if (heroItem != null) {
+        HeroBanner(
+            item = heroItem,
+            onPlay = { onPlay(heroItem) },
+            modifier = Modifier.fillMaxWidth().height(220.dp)
+        )
+    } else {
+        HeroPlaceholder()
+    }
+}
+
+@Composable
+private fun HeroPlaceholder() {
+    Box(
+        modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(12.dp))
+    ) {
+        Image(
+            painter = painterResource(id = R.drawable.heroplaceholder),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+            alignment = Alignment.TopCenter
+        )
+        Box(modifier = Modifier.fillMaxSize().background(
+            Brush.horizontalGradient(
+                0f to Color.Black.copy(alpha = 0.6f),
+                0.5f to Color.Black.copy(alpha = 0.1f),
+                1f to Color.Transparent
+            )
+        ))
+        androidx.compose.material3.CircularProgressIndicator(
+            color = Color.White.copy(alpha = 0.35f), strokeWidth = 2.dp,
+            modifier = Modifier.size(24.dp).align(Alignment.Center)
+        )
+    }
+}
+
+@Composable
+private fun ContinueWatchingSection(
+    items: List<ContinueWatchingItem>,
+    isLoading: Boolean,
+    onClick: (ContinueWatchingItem) -> Unit
+) {
+    val watchedItems = items.filter { it.percentage > 0 && !it.vodItem.poster.isNullOrBlank() }
+    val recommendedItems = items.filter { it.percentage == 0 && !it.vodItem.poster.isNullOrBlank() }
+    val merged = watchedItems + recommendedItems
+    if (merged.isEmpty() && !isLoading) return
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (watchedItems.isNotEmpty()) {
+            Text(stringResource(R.string.recently_watched),
+                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        }
+        if (watchedItems.isNotEmpty() && recommendedItems.isNotEmpty()) {
+            Text(stringResource(R.string.dot_separator), color = Color.White.copy(alpha = 0.3f), fontSize = 16.sp)
+        }
+        if (recommendedItems.isNotEmpty() || isLoading) {
+            Text(stringResource(R.string.home_recommended_short),
+                color = if (watchedItems.isEmpty()) Color.White else Color.White.copy(alpha = 0.5f),
+                fontSize = if (watchedItems.isEmpty()) 16.sp else 14.sp,
+                fontWeight = if (watchedItems.isEmpty()) FontWeight.SemiBold else FontWeight.Normal)
+        }
+    }
+    ContentRow(
+        title = "",
+        items = merged,
+        onItemClick = onClick,
+        isLoading = isLoading
+    )
+    Spacer(Modifier.height(20.dp))
+}
+
+@Composable
+private fun FavouriteChannelsSection(
+    favourites: List<Channel>,
+    onClick: (Channel, String) -> Unit
+) {
+    if (favourites.isEmpty()) return
+    val label = stringResource(R.string.home_favourite_channels)
+    val listState = rememberLazyListState()
+    val snap = androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior(listState)
+
+    Text(label,
+        color = Color(0xFFFBBF24), fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(bottom = 10.dp))
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+    ) {
+        val gap = 14.dp
+        val cardWidth = (maxWidth - gap * 4) / 5
+        LazyRow(
+            state = listState,
+            horizontalArrangement = Arrangement.spacedBy(gap),
+            contentPadding = PaddingValues(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            modifier = Modifier.fillMaxWidth(),
+            flingBehavior = snap
+        ) {
+            itemsIndexed(favourites, key = { i, ch -> ch.id + "_" + i }) { _, ch ->
+                Box(modifier = Modifier.width(cardWidth)) {
+                    LiveChannelCard(channel = ch, onClick = { onClick(ch, label) })
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(20.dp))
+}
+
+@Composable
+private fun FavouriteCategoriesSection(
+    categories: List<Pair<String, String>>,
+    onCategoryClick: (String, String) -> Unit
+) {
+    if (categories.isEmpty()) return
+    Text(stringResource(R.string.home_favourite_categories),
+        color = Color(0xFFFBBF24), fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(bottom = 10.dp))
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(start = 8.dp, end = 16.dp, top = 8.dp, bottom = 8.dp)
+    ) {
+        items(categories) { (id, name) ->
+            CategoryChip(name = name, onClick = { onCategoryClick(id, name) })
+        }
+    }
+}
+
+@Composable
+private fun CategoryChip(name: String, onClick: () -> Unit) {
+    val cleanName = remember(name) { stripContentPrefix(name) }
+    var isFocused by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+            .graphicsLayer {
+                scaleX = if (isFocused) 1.05f else 1f
+                scaleY = if (isFocused) 1.05f else 1f
+            }
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.08f))
+            .border(
+                width = if (isFocused) 0.dp else 1.dp,
+                color = Color.White.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(8.dp)
+            )
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = cleanName,
+            color = if (isFocused) Color.White else Color.White.copy(alpha = 0.7f),
+            fontSize = 13.sp,
+            fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+// ============================================================================
+// SECTION 8 -- Card-level composables (HeroBanner, ContentRow,
+// LandscapeContentCard, LiveChannelCard, SidebarButton)
+// ============================================================================
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun HeroBanner(
+    item: ContinueWatchingItem,
+    onPlay: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    val displayName = remember(item.vodItem.name) { stripContentPrefix(item.vodItem.name) }
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .border(
+                width = if (isFocused) 2.dp else 1.dp,
+                color = if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(12.dp)
+            )
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(item.vodItem.poster).size(960, 540).allowHardware(DeviceInfo.allowHardwareBitmaps).build(),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+            alignment = Alignment.TopCenter
+        )
+        Box(modifier = Modifier.fillMaxSize().background(
+            Brush.horizontalGradient(
+                0f to Color.Black.copy(alpha = 0.88f),
+                0.4f to Color.Black.copy(alpha = 0.5f),
+                0.7f to Color.Black.copy(alpha = 0.2f),
+                1f to Color.Transparent
+            )
+        ))
+        Column(
+            modifier = Modifier.align(Alignment.CenterStart)
+                .padding(start = 32.dp, end = 200.dp, top = 24.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(displayName,
+                color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            if (item.percentage > 0) {
+                Text(stringResource(R.string.home_resume_format, item.timePosition),
+                    color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                LinearProgressIndicator(
+                    progress = item.percentage / 100f,
+                    modifier = Modifier.width(180.dp).height(4.dp).clip(RoundedCornerShape(2.dp)),
+                    color = Color(0xFF3B82F6), trackColor = Color.White.copy(alpha = 0.2f)
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Surface(
+                onClick = onPlay,
+                interactionSource = interactionSource,
+                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+                colors = ClickableSurfaceDefaults.colors(
+                    containerColor = Color.White.copy(alpha = 0.15f),
+                    focusedContainerColor = Color(0xFF3B82F6)
+                ),
+                border = ClickableSurfaceDefaults.border(
+                    border = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp)),
+                    focusedBorder = Border(BorderStroke(0.dp, Color.Transparent), shape = RoundedCornerShape(8.dp))
+                )
+            ) {
+                Text(stringResource(
+                    if (item.percentage > 0) R.string.home_button_continue else R.string.home_button_play
+                ),
+                    color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
+            }
+        }
+    }
+}
+
+enum class CardType { LANDSCAPE, PORTRAIT }
+
+@Composable
+fun ContentRow(
+    title: String,
+    items: List<ContinueWatchingItem>,
+    onItemClick: (ContinueWatchingItem) -> Unit,
+    cardType: CardType = CardType.LANDSCAPE,
+    isLoading: Boolean = false
+) {
+    Column {
+        if (title.isNotEmpty()) {
+            Text(title, color = Color.White, fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(bottom = 10.dp))
+        }
+        if (isLoading && items.isEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                repeat(5) {
+                    Box(modifier = Modifier.weight(1f).aspectRatio(2f / 3f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.White.copy(alpha = 0.06f)))
+                }
+            }
+        } else if (items.isNotEmpty()) {
+            val listState = rememberLazyListState()
+            val snapFling = androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior(listState)
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val gap = 14.dp
+                val cardWidth = (maxWidth - gap * 4) / 5
+                LazyRow(
+                    state = listState,
+                    horizontalArrangement = Arrangement.spacedBy(gap),
+                    contentPadding = PaddingValues(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    flingBehavior = snapFling
+                ) {
+                    itemsIndexed(items, key = { i, item -> item.vodItem.id + "_" + i }) { _, item ->
+                        Box(modifier = Modifier.width(cardWidth)) {
+                            LandscapeContentCard(item = item, onClick = { onItemClick(item) })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun LandscapeContentCard(item: ContinueWatchingItem, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(
+        targetValue = if (isFocused) 1.06f else 1f,
+        animationSpec = androidx.compose.animation.core.spring(
+            stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+        ),
+        label = "card_scale"
+    )
+    val displayName = remember(item.vodItem.name) { stripContentPrefix(item.vodItem.name) }
+
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+    ) {
+        Box(
+            modifier = Modifier.fillMaxWidth().aspectRatio(3f / 4f)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clip(RoundedCornerShape(10.dp))
+                .border(
+                    width = if (isFocused) 2.dp else 1.dp,
+                    color = if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.1f),
+                    shape = RoundedCornerShape(10.dp)
+                )
+        ) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(item.vodItem.poster).size(240, 340).allowHardware(DeviceInfo.allowHardwareBitmaps).build(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+            Box(modifier = Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    0f to Color.Transparent,
+                    0.55f to Color.Transparent,
+                    1f to Color.Black.copy(alpha = 0.85f)
+                )
+            ))
+            Column(modifier = Modifier.align(Alignment.BottomStart).padding(8.dp)) {
+                Text(displayName,
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (item.percentage > 0) {
+                    Spacer(Modifier.height(4.dp))
+                    LinearProgressIndicator(
+                        progress = item.percentage / 100f,
+                        modifier = Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)),
+                        color = Color(0xFF3B82F6),
+                        trackColor = Color.White.copy(alpha = 0.2f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun LiveChannelCard(channel: Channel, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(
+        targetValue = if (isFocused) 1.06f else 1f,
+        animationSpec = androidx.compose.animation.core.spring(
+            stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+        ),
+        label = "live_scale"
+    )
+    val displayName = remember(channel.name) { stripContentPrefix(channel.name) }
+
+    Box(
+        modifier = Modifier.fillMaxWidth().height(110.dp)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize()
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clip(RoundedCornerShape(10.dp))
+                .border(
+                    width = if (isFocused) 2.dp else 1.dp,
+                    color = if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.1f),
+                    shape = RoundedCornerShape(10.dp)
+                )
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().weight(1f)
+                        .background(Color(0xFF0D0D14)).padding(12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val logoUrl = channel.logo ?: com.kam.magplayer.epg.EpgRepository.iconFor(channel)
+                    if (!logoUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current)
+                                .data(logoUrl).size(240, 160).allowHardware(DeviceInfo.allowHardwareBitmaps)
+                                .crossfade(300)
+                                .diskCachePolicy(CachePolicy.ENABLED)
+                                .memoryCachePolicy(CachePolicy.ENABLED).build(),
+                            contentDescription = channel.name,
+                            placeholder = androidx.compose.ui.graphics.painter.ColorPainter(Color(0xFF1A1A2E)),
+                            error = androidx.compose.ui.graphics.painter.ColorPainter(Color(0xFF0D0D14)),
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    } else {
+                        Text(channel.name.take(2).uppercase(),
+                            color = Color(0xFF3B82F6), fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().background(Color(0xFF0A0A14))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.clip(RoundedCornerShape(3.dp))
+                            .background(Color(0xFFEF4444))
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                    ) {
+                        Text(stringResource(R.string.home_live_badge),
+                            color = Color.White, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(displayName,
+                        color = Color.White.copy(alpha = 0.9f), fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun SidebarButton(iconRes: Int, label: String, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.width(64.dp).wrapContentHeight(),
+        interactionSource = interactionSource,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = Color.Transparent
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = Border(BorderStroke(0.dp, Color.Transparent), shape = RoundedCornerShape(8.dp)),
+            focusedBorder = Border(BorderStroke(0.dp, Color.Transparent), shape = RoundedCornerShape(8.dp))
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.0f)
+    ) {
+        Row(modifier = Modifier.wrapContentHeight()) {
+            Box(modifier = Modifier.width(3.dp).height(44.dp)
+                .align(Alignment.CenterVertically)
+                .background(if (isFocused) Color(0xFF3B82F6) else Color.Transparent,
+                    RoundedCornerShape(2.dp)))
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f).padding(vertical = 10.dp, horizontal = 2.dp)
+            ) {
+                Icon(
+                    painter = painterResource(iconRes),
+                    contentDescription = label,
+                    modifier = Modifier.size(26.dp),
+                    tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.35f)
+                )
+                Text(label,
+                    fontSize = 10.sp,
+                    fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (isFocused) Color.White else Color.White.copy(alpha = 0.35f),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, letterSpacing = 0.5.sp)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SECTION 9 -- Legacy composables (kept for binary compatibility -- not used
+// by HomeScreen but other fragments may reference them)
+// ============================================================================
+
+@Composable
+fun LoadingPlaceholderCard(fillWidth: Boolean = false) {
+    val base = if (fillWidth)
+        Modifier.fillMaxWidth().height(200.dp)
+    else
+        Modifier.width(135.dp).height(200.dp)
+    Box(
+        modifier = base
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.DarkGray.copy(alpha = 0.3f))
+            .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        androidx.compose.material3.CircularProgressIndicator(
+            modifier = Modifier.size(35.dp),
+            color = Color.White.copy(alpha = 0.5f),
+            strokeWidth = 3.dp
+        )
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun CompactStatsBox(
+    state: StatsViewState,
+    portals: List<Portal> = emptyList(),
+    activePortalId: String = "",
+    onPortalSwitch: (Portal) -> Unit = {}
+) {
+    var showSwitcher by remember { mutableStateOf(false) }
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    LaunchedEffect(activePortalId) { showSwitcher = false }
+    val canSwitch = portals.size > 1
+    val portalName = when (state) {
+        is StatsViewState.Success -> state.stats.name ?: stringResource(R.string.stats_portal_name)
+        else -> stringResource(R.string.stats_portal_name)
+    }
+    Box(modifier = Modifier.width(240.dp).wrapContentHeight()) {
+        Column(
+            modifier = Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.5f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Surface(
+                onClick = { if (canSwitch) showSwitcher = !showSwitcher },
+                modifier = Modifier.fillMaxWidth(),
+                interactionSource = interactionSource,
+                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(6.dp)),
+                colors = ClickableSurfaceDefaults.colors(
+                    containerColor = Color.Transparent,
+                    focusedContainerColor = Color.White.copy(alpha = 0.08f)
+                )
+            ) {
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp, horizontal = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(portalName,
+                        color = if (isFocused) Color(0xFF3B82F6) else Color.White,
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f))
+                    if (canSwitch) {
+                        Text(if (showSwitcher) stringResource(R.string.arrow_up) else stringResource(R.string.arrow_down),
+                            color = Color(0xFF3B82F6), fontSize = 10.sp,
+                            modifier = Modifier.padding(start = 4.dp))
+                    }
+                }
+            }
+            Divider(color = Color.White.copy(alpha = 0.1f))
+            when (state) {
+                is StatsViewState.Success -> {
+                    val s = state.stats
+                    CompactInfoRow(stringResource(R.string.stats_status),
+                        stringResource(if (s.isOnline) R.string.stats_status_online else R.string.stats_status_offline),
+                        if (s.isOnline) Color(0xFF4CAF50) else Color(0xFFF44336))
+                    if (!s.isOnline && !s.errorMessage.isNullOrBlank()) {
+                        Text(s.errorMessage, color = Color(0xFFF44336).copy(alpha = 0.85f),
+                            fontSize = 10.sp, maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 4.dp))
+                    }
+                    CompactInfoRow(stringResource(R.string.stats_iptv_categories), s.iptvCategoryCount.toString())
+                    CompactInfoRow(stringResource(R.string.stats_vod_categories), s.movieCategoryCount.toString())
+                    CompactInfoRow(stringResource(R.string.stats_series_categories), s.seriesCategoryCount.toString())
+                }
+                else -> Text(stringResource(R.string.loading_text), color = Color.White, fontSize = 12.sp)
+            }
+        }
+        if (showSwitcher && portals.isNotEmpty()) {
+            Box(modifier = Modifier.fillMaxWidth().wrapContentHeight().offset(y = 0.dp).zIndex(10f)) {
+                Column(
+                    modifier = Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF0F1923))
+                        .border(1.dp, Color(0xFF3B82F6).copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(portalName,
+                        color = Color(0xFF3B82F6), fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
+                    Divider(color = Color(0xFF3B82F6).copy(alpha = 0.3f))
+                    Spacer(Modifier.height(4.dp))
+                    portals.forEach { portal ->
+                        val isActive = portal.id == activePortalId
+                        PortalSwitcherRow(portal, isActive) {
+                            showSwitcher = false
+                            if (!isActive) onPortalSwitch(portal)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun PortalSwitcherRow(portal: Portal, isActive: Boolean, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        interactionSource = interactionSource,
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(4.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (isActive) Color(0xFF1E3A5F).copy(alpha = 0.6f) else Color.Transparent,
+            focusedContainerColor = Color(0xFF1E3A5F).copy(alpha = 0.8f)
+        )
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(portal.name,
+                color = if (isActive || isFocused) Color.White else Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f))
+            if (isActive) Text(stringResource(R.string.check_mark_icon), color = Color(0xFF3B82F6), fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun CompactInfoRow(label: String, value: String, color: Color = Color.White) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = Color.LightGray, fontSize = 11.sp)
+        Text(value, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
