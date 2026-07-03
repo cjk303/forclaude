@@ -1,0 +1,209 @@
+package com.kam.magplayer
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+
+/**
+ * Full-screen info card shown before a MOVIE starts playing (#1b). Replaces
+ * the previous behaviour where tapping a recommended/hero film autoplayed
+ * immediately with no description -- the thing Tomek flagged as the app
+ * feeling like a black box.
+ *
+ * Movies only. Series are NOT routed here: tapping a series already drills
+ * into SeriesBrowseFragment (the season/episode list), which is itself the
+ * "choose before playing" step -- a second card there would be redundant.
+ *
+ * Renders entirely from VodItem fields already in hand at tap time
+ * (name/description/poster/year/duration), so there is NO details fetch and
+ * no loading state.
+ *
+ * Add-to-favourites and Trailer are shown as deliberately disabled "soon"
+ * slots: there is no favourite-VOD store yet (only favourite channels and
+ * categories exist), and Tomek listed the trailer as a future wish. Showing
+ * them disabled signals intent without faking functionality.
+ */
+@Composable
+fun VodInfoCard(
+    item: VodItem,
+    onPlay: () -> Unit,
+    onBack: () -> Unit
+) {
+    val accent = Color(0xFF3B82F6)
+    val playFocus = remember { FocusRequester() }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.82f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth(0.82f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color(0xFF12121A))
+                .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp))
+                .padding(28.dp),
+            horizontalArrangement = Arrangement.spacedBy(28.dp)
+        ) {
+            // -- Poster -------------------------------------------------------
+            Box(
+                modifier = Modifier
+                    .width(200.dp)
+                    .height(300.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.Black.copy(alpha = 0.4f)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (!item.poster.isNullOrBlank()) {
+                    AsyncImage(
+                        model = coil.request.ImageRequest.Builder(LocalContext.current)
+                            .data(item.poster).size(400, 600)
+                            .allowHardware(DeviceInfo.allowHardwareBitmaps).build(),
+                        contentDescription = item.name,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Image(
+                        painter = painterResource(id = R.drawable.heroplaceholder),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+
+            // -- Details ------------------------------------------------------
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = item.name,
+                    color = Color.White,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                // Metadata line (year / duration) -- only the parts present.
+                val meta = listOfNotNull(
+                    item.year?.takeIf { it.isNotBlank() },
+                    item.duration?.takeIf { it.isNotBlank() }
+                ).joinToString("  \u2022  ")
+                if (meta.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(text = meta, color = accent, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                // Description -- scrollable so a long plot can't push buttons
+                // off-screen. Blank descriptions get a muted placeholder
+                // rather than an empty gap.
+                val plot = item.description.takeIf { it.isNotBlank() }
+                Box(modifier = Modifier.fillMaxWidth().height(120.dp)) {
+                    Text(
+                        text = plot ?: stringResource(R.string.vod_info_no_description),
+                        color = if (plot != null) Color(0xFFCCCCCC) else Color(0xFF777788),
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                    )
+                }
+
+                Spacer(Modifier.height(20.dp))
+
+                // -- Actions --------------------------------------------------
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    SettingsButton(
+                        text = stringResource(R.string.vod_info_play),
+                        onClick = onPlay,
+                        modifier = Modifier.focusRequester(playFocus),
+                        containerColor = accent,
+                        focusedContainerColor = Color(0xFF2563EB)
+                    )
+                    SettingsButton(
+                        text = stringResource(R.string.back_button),
+                        onClick = onBack,
+                        containerColor = Color.White.copy(alpha = 0.06f),
+                        focusedContainerColor = Color(0xFF475569)
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                // -- Deferred slots (visible, disabled) -----------------------
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    DisabledSoonChip(stringResource(R.string.vod_info_add_favourite))
+                    DisabledSoonChip(stringResource(R.string.vod_info_trailer))
+                }
+            }
+        }
+    }
+
+    // Land focus on Play so the remote's OK button plays immediately, and a
+    // single Back press (handled by the caller) dismisses the card.
+    LaunchedEffect(item.id) { runCatching { playFocus.requestFocus() } }
+}
+
+/**
+ * A non-focusable, visibly-disabled pill marking a feature that exists in
+ * the design but isn't wired yet (add-to-favourites, trailer). Not a button
+ * -- it intentionally can't take D-pad focus, so users never tab onto a
+ * dead control.
+ */
+@Composable
+private fun DisabledSoonChip(label: String) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.White.copy(alpha = 0.04f))
+            .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(text = label, color = Color(0xFF555566), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text(
+                text = stringResource(R.string.vod_info_soon),
+                color = Color(0xFF44445A),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
