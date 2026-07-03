@@ -1,0 +1,381 @@
+package com.kam.magplayer
+
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.kam.magplayer.epg.EpgRepository
+import com.kam.magplayer.epg.MagEpg
+import com.kam.magplayer.epg.StalkerEpgEvent
+import com.kam.magplayer.epg.XmlTvLoader
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
+import com.kam.magplayer.epg.EpgOverrideRepository
+class TvHomeViewModel : ViewModel() {
+
+    // ─── Client caches (existing) ────────────────────────────────────────────
+    private var stalkerClient: StalkerClient? = null
+    private var stalkerClientKey: String? = null
+
+    private var vodClient: VodClient? = null
+    private var vodClientKey: String? = null
+
+    fun getStalkerClient(portalUrl: String, macAddress: String): StalkerClient {
+        val key = "$portalUrl|$macAddress"
+        if (stalkerClientKey != key || stalkerClient == null) {
+            stalkerClient = StalkerClient(portalUrl, macAddress)
+            stalkerClientKey = key
+        }
+        return stalkerClient!!
+    }
+
+    fun getVodClient(portalUrl: String, macAddress: String): VodClient {
+        val key = "$portalUrl|$macAddress"
+        if (vodClientKey != key || vodClient == null) {
+            vodClient = VodClient(portalUrl, macAddress)
+            vodClientKey = key
+        }
+        return vodClient!!
+    }
+
+    // ─── Home-screen state ───────────────────────────────────────────────────
+
+    private val _homeUiState = MutableStateFlow(HomeUiState())
+    val homeUiState: StateFlow<HomeUiState> = _homeUiState.asStateFlow()
+
+    private val _clockText = MutableStateFlow("")
+    val clockText: StateFlow<String> = _clockText.asStateFlow()
+
+    private val userRegion: String by lazy { inferRegionFromLocaleInternal() }
+    private var loader: PortalDataLoader? = null
+    private var clockJob: Job? = null
+    private var loadJob: Job? = null
+    private var bootstrapped = false
+
+    // ─── EPG-loading guards ──────────────────────────────────────────────────
+    // Tracks which portal we last loaded XMLTV / MagEpg for, so subsequent
+    // resumes don't re-download or re-init. Reset implicitly by switchPortal()
+    // since the recorded id won't match the new portal's id.
+    private var xmltvLoadedForPortalId: String? = null
+    private var magEpgInitedForPortalId: String? = null
+    private var epgCollectorJob: Job? = null
+
+    fun initialize(context: Context) {
+        if (bootstrapped) return
+        bootstrapped = true
+        loader = PortalDataLoader(context.applicationContext, this)
+        startClock()
+        viewModelScope.launch {
+            launch { bootstrapLocalChannels(context) }
+            launch { loadPortalList(context) }
+            launch { triggerReload(context) }
+        }
+    }
+
+    fun onResume(context: Context) {
+        if (!bootstrapped) return
+        triggerReload(context)
+    }
+
+    fun switchPortal(context: Context, newPortal: Portal) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val repo = PortalRepository(context)
+            val oldId = repo.getActivePortalId()
+            if (oldId != null && oldId != newPortal.id) {
+                PortalCache.clear(oldId)
+                SearchCache.clearPortal(oldId)
+            }
+            repo.setActivePortalId(newPortal.id)
+            _homeUiState.update {
+                it.copy(
+                    activePortalId = newPortal.id,
+                    statsState = StatsViewState.Loading,
+                    continueWatchingItems = emptyList(),
+                    isLoadingRecommendations = true,
+                    newPortalFetchDone = false,
+                    isFetchingForNewPortal = false
+                )
+            }
+            triggerReload(context)
+        }
+    }
+
+    // ─── Internal orchestration ──────────────────────────────────────────────
+
+    private fun startClock() {
+        clockJob?.cancel()
+        clockJob = viewModelScope.launch {
+            val fmt = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+                timeZone = TimeZone.getDefault()
+            }
+            while (isActive) {
+                _clockText.value = fmt.format(Calendar.getInstance().time)
+                delay(60_000)
+            }
+        }
+    }
+
+    private suspend fun bootstrapLocalChannels(context: Context) {
+        val repo = PortalRepository(context)
+        val portal = withContext(Dispatchers.IO) {
+            repo.getPortals().find { it.id == repo.getActivePortalId() }
+        } ?: return
+        val (recent, favs) = loader!!.loadLocalChannels(portal)
+        _homeUiState.update { current ->
+            current.copy(
+                recentChannels = if (current.recentChannels.isEmpty()) recent else current.recentChannels,
+                favoriteChannels = if (current.favoriteChannels.isEmpty()) favs else current.favoriteChannels
+            )
+        }
+        loader!!.prewarmLogos(recent + favs)
+    }
+
+    private suspend fun loadPortalList(context: Context) {
+        val repo = PortalRepository(context)
+        val portals = withContext(Dispatchers.IO) { repo.getPortals() }
+        val activeId = withContext(Dispatchers.IO) { repo.getActivePortalId() ?: "" }
+        _homeUiState.update { it.copy(allPortals = portals, activePortalId = activeId) }
+    }
+
+    private fun triggerReload(context: Context) {
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
+            val portal = withContext(Dispatchers.IO) {
+                PortalRepository(context).getActivePortal()
+            }
+            if (portal == null) {
+                _homeUiState.update {
+                    it.copy(statsState = StatsViewState.NoPortal, isLoadingRecommendations = false)
+                }
+                return@launch
+            }
+
+            // ── NEW: kick off EPG loading in parallel with everything else.
+            // Fire-and-forget; results land in EpgRepository which any composable
+            // observing xmltvVersion / stalkerEpgVersion will pick up.
+            launch { loadEpgForPortal(context, portal) }
+
+            val (recent, favs) = loader!!.loadLocalChannels(portal)
+            _homeUiState.update { it.copy(recentChannels = recent, favoriteChannels = favs) }
+
+            val favCatsJob = launch {
+                val favCats = loader!!.loadFavouriteCategories(portal)
+                _homeUiState.update { it.copy(favouriteCategories = favCats) }
+            }
+
+            when {
+                portal.isM3U -> loadM3uPortal(portal)
+                portal.isXtream -> loadXtreamPortal(portal)
+                else -> loadStalkerPortal(portal)
+            }
+
+            favCatsJob.join()
+            maybeFetchForNewPortal(portal)
+        }
+    }
+
+    /**
+     * Loads EPG for the active portal:
+     *  - XMLTV: download + parse external EPG URL if portal has one, push to
+     *    EpgRepository. Guarded by [xmltvLoadedForPortalId] so it only fires
+     *    once per portal across resume cycles.
+     *  - Stalker: initialise MagEpg with the portal credentials and start
+     *    collecting events from its SharedFlow into EpgRepository. Guarded
+     *    by [magEpgInitedForPortalId] for the same reason.
+     *
+     * Mirrors the logic from MainActivity.initStalkerPortal / initM3uPortal
+     * / initXtreamPortal but adapted for the TV ViewModel's lifecycle.
+     */
+    private suspend fun loadEpgForPortal(context: Context, portal: Portal) {
+        // ── XMLTV ──────────────────────────────────────────────────────────
+        // M3U and Xtream use portal.epgUrl with portal.xmltvUrl as fallback.
+        // Stalker uses portal.xmltvUrl only (matching MainActivity behaviour).
+        val xmltvUrl = com.kam.magplayer.epg.EpgSourceResolver.resolveEpgUrl(context, portal)
+
+        Log.d("TvHomeViewModel", "loadEpgForPortal: portal=${portal.name} " +
+                "type=${if (portal.isM3U) "M3U" else if (portal.isXtream) "Xtream" else "Stalker"} " +
+                "xmltvUrl='${xmltvUrl}' " +
+                "lastLoadedFor=$xmltvLoadedForPortalId")
+
+        if (!xmltvUrl.isNullOrBlank() && xmltvLoadedForPortalId != portal.id) {
+            xmltvLoadedForPortalId = portal.id
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    Log.d("TvHomeViewModel", "Loading XMLTV from $xmltvUrl")
+                    val httpClient = if (portal.isM3U || portal.isXtream) {
+                        okhttp3.OkHttpClient()
+                    } else {
+                        getStalkerClient(portal.effectiveUrl, portal.macAddress).getHttpClient()
+                    }
+                    val map = XmlTvLoader.loadXmlTv(xmltvUrl, httpClient, context)
+                    if (map.isNotEmpty()) {
+                        EpgRepository.putXmlTvMap(map)
+                        EpgRepository.setOverrides(EpgOverrideRepository(context).getOverrides(portal.id))
+                        Log.d("TvHomeViewModel", "XMLTV loaded: ${map.size} channels")
+                    } else {
+                        Log.w("TvHomeViewModel", "XMLTV returned empty map for $xmltvUrl")
+                        // Reset so a subsequent retry can re-attempt
+                        xmltvLoadedForPortalId = null
+                    }
+                } catch (e: Exception) {
+                    Log.e("TvHomeViewModel", "XMLTV load failed", e)
+                    xmltvLoadedForPortalId = null
+                }
+            }
+        }
+
+        // ── Stalker per-channel EPG via MagEpg ────────────────────────────
+        // Only Stalker portals benefit from this — M3U has no equivalent
+        // endpoint, Xtream uses get_short_epg via its own client elsewhere.
+        if (!portal.isM3U && !portal.isXtream && magEpgInitedForPortalId != portal.id) {
+            magEpgInitedForPortalId = portal.id
+            val stalker = getStalkerClient(portal.effectiveUrl, portal.macAddress)
+            MagEpg.init(
+                portalUrl = portal.effectiveUrl,
+                client = stalker.getHttpClient(),
+                mac = portal.macAddress,
+                tokenProvider = {
+                    // Same pattern as MainActivity: tokenProvider must not run
+                    // on the main thread. MagEpg's workerLoop is on IO so
+                    // this is fine.
+                    stalker.handshakeBlocking()
+                    stalker.token ?: ""
+                }
+            )
+
+            // Collector lives for the rest of the ViewModel lifetime, but is
+            // cancelled and restarted on portal switch (the guard above).
+            epgCollectorJob?.cancel()
+            epgCollectorJob = viewModelScope.launch {
+                MagEpg.epgFlow.collect { (channelId, events) ->
+                    EpgRepository.putStalkerEvents(channelId, events)
+                }
+            }
+            Log.d("TvHomeViewModel", "MagEpg initialised for portal ${portal.name}")
+        }
+    }
+
+    private suspend fun loadM3uPortal(portal: Portal) {
+        val result = loader!!.loadM3u(portal, userRegion)
+        _homeUiState.update {
+            it.copy(
+                statsState = StatsViewState.Success(result.stats),
+                continueWatchingItems = result.items,
+                isLoadingRecommendations = false
+            )
+        }
+    }
+
+    private suspend fun loadXtreamPortal(portal: Portal) {
+        val cache = PortalCache.get(portal.id)
+        if (cache.genres.isNotEmpty()) {
+            _homeUiState.update {
+                it.copy(statsState = StatsViewState.Success(PortalStats(
+                    name = portal.name, isOnline = true,
+                    iptvCategoryCount = cache.genres.size,
+                    movieCategoryCount = cache.vodCategories.size,
+                    seriesCategoryCount = cache.seriesCategories.size
+                )))
+            }
+        }
+        coroutineScope {
+            launch {
+                val stats = loader!!.loadXtreamStats(portal)
+                _homeUiState.update { it.copy(statsState = StatsViewState.Success(stats)) }
+            }
+            launch {
+                val items = loader!!.loadXtreamItems(portal, userRegion)
+                _homeUiState.update {
+                    it.copy(continueWatchingItems = items, isLoadingRecommendations = false)
+                }
+            }
+        }
+    }
+
+    private suspend fun loadStalkerPortal(portal: Portal) {
+        loader!!.stalkerQuickStats(portal)?.let { quick ->
+            _homeUiState.update { it.copy(statsState = StatsViewState.Success(quick)) }
+        }
+        coroutineScope {
+            launch {
+                val stats = loader!!.loadStalkerStats(portal)
+                _homeUiState.update { it.copy(statsState = StatsViewState.Success(stats)) }
+            }
+            launch {
+                val items = loader!!.loadStalkerItems(portal, userRegion)
+                _homeUiState.update {
+                    it.copy(continueWatchingItems = items, isLoadingRecommendations = false)
+                }
+            }
+        }
+    }
+
+    private suspend fun maybeFetchForNewPortal(portal: Portal) {
+        val ui = _homeUiState.value
+        if (!ui.hasNothingToShow || ui.isLoadingRecommendations || ui.newPortalFetchDone) return
+        _homeUiState.update { it.copy(isFetchingForNewPortal = true) }
+        val channels = loader!!.fetchFirstChannelsForNewPortal(portal)
+        _homeUiState.update {
+            it.copy(
+                recentChannels = if (channels.isNotEmpty()) channels else it.recentChannels,
+                isFetchingForNewPortal = false,
+                newPortalFetchDone = true
+            )
+        }
+    }
+
+    private fun inferRegionFromLocaleInternal(): String {
+        val appLocales = androidx.appcompat.app.AppCompatDelegate.getApplicationLocales()
+        val appTag = if (!appLocales.isEmpty) appLocales[0]?.language else null
+        val tag = appTag?.ifBlank { null } ?: Locale.getDefault().language
+        return when (tag.lowercase()) {
+            "pl"        -> "PL"
+            "de"        -> "DE"
+            "fr"        -> "FR"
+            "it"        -> "IT"
+            "es"        -> "ES"
+            "nl"        -> "NL"
+            "pt"        -> "PT"
+            "ru"        -> "RU"
+            "uk"        -> "UK"
+            "ar"        -> "ARAB"
+            "tr"        -> "TR"
+            "cs", "cz"  -> "CZ"
+            "sk"        -> "SK"
+            "hu"        -> "HU"
+            "ro"        -> "RO"
+            "bg"        -> "BG"
+            "el", "gr"  -> "GR"
+            "sv"        -> "SE"
+            "no", "nb", "nn" -> "NO"
+            "da"        -> "DK"
+            "fi"        -> "FI"
+            "sr"        -> "RS"
+            "hr"        -> "HR"
+            "hi"        -> "IN"
+            "zh"        -> "CN"
+            "ja"        -> "JP"
+            "ko"        -> "KR"
+            "th"        -> "TH"
+            else        -> "EN"
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        clockJob?.cancel()
+        loadJob?.cancel()
+        epgCollectorJob?.cancel()
+        MagEpg.shutdown()
+        stalkerClient = null
+        vodClient = null
+        loader = null
+    }
+}
