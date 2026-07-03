@@ -1,0 +1,2816 @@
+package com.kam.magplayer
+
+import android.app.Activity
+import android.app.PictureInPictureParams
+import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.util.Rational
+import android.view.GestureDetector
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.FocusFinder
+import android.view.WindowManager
+import android.widget.SeekBar
+import android.widget.Toast
+
+import androidx.activity.viewModels
+import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AlertDialog
+import androidx.activity.enableEdgeToEdge
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import com.kam.magplayer.databinding.ActivityPlayerBinding
+import com.kam.magplayer.epg.EpgRepository
+import com.kam.magplayer.epg.StalkerEpgEvent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import java.util.concurrent.TimeUnit
+
+
+
+/**
+ * Channel menu focus model.
+ * Two panes: category rail (left) and channel list (right).
+ * D-pad LEFT/RIGHT moves between panes, UP/DOWN within a pane.
+ */
+enum class MenuPane { CATEGORIES, CHANNELS }
+
+/**
+ * Simple category match: the category name must contain the query
+ * (case-insensitive, whitespace trimmed).
+ *
+ * "pl" matches "PL| Premium Play"   YES
+ * "pl" matches "DE| Plex TV"        YES
+ * "pl" matches "Starzplay"          YES
+ * "pl" does NOT match "News"        NO
+ */
+internal fun matchesCategoryQuery(name: String, query: String): Boolean {
+    if (query.isBlank()) return true
+    return name.contains(query.trim(), ignoreCase = true)
+}
+
+class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
+
+    private lateinit var binding: ActivityPlayerBinding
+    private lateinit var settings: PlayerSettingsRepository
+    private lateinit var historyRepository: HistoryRepository
+    private lateinit var favoriteChannelsRepository: FavoriteChannelsRepository
+    private lateinit var watchProgressRepository: WatchProgressRepository
+    private lateinit var playerOptimizer: PlayerOptimizer
+
+    private var libVLC: LibVLC? = null
+    private var mediaPlayer: MediaPlayer? = null
+
+
+
+    private val streamInfoViewModel: StreamInfoViewModel by viewModels()
+
+    private var channels by mutableStateOf<List<Channel>>(emptyList())
+    private var currentIndex: Int = -1
+    private var videoUrl: String? = null
+    private var videoId: String? = null
+
+    private lateinit var portalUrl: String
+    private lateinit var macAddress: String
+
+    private val hideControlsHandler = Handler(Looper.getMainLooper())
+    private lateinit var gestureDetector: GestureDetector
+
+    private var isVOD = false
+    private var hasPipSupport = false
+    private var isTV = false
+
+    private var currentBuffering: Float = 100f
+    private var lastDecodedFrames = 0
+    private var lastDecodedUpdateTs = 0L
+
+    private var lastStreamUrl: String? = null
+    private var lastStreamUserAgent: String? = null
+    private var lastStreamReferrer: String? = null
+
+    // HLS demuxer fallback. We DEFAULT to libVLC's adaptive HLS demuxer
+    // (forceLegacyHlsDemux = false), which plays the widest range of
+    // providers -- including Xtream panels whose .m3u8 playlists the legacy
+    // demuxer can't parse (confirmed: Tomek's nxtplay.xyz portal -- the mini
+    // player, which never forced legacy, played fine while the full player,
+    // which did, span forever). If an HLS stream soft-fails (EncounteredError),
+    // we flip this to true ONCE and let the reconnect retry with ":demux=hls"
+    // (legacy), which is more tolerant of some spec violations and was the
+    // original workaround for the Tesla 2K TV SegmentList::updateWith SIGABRT.
+    // Reset to false on every new channel so a working stream never gets the
+    // legacy demuxer forced on it by an unrelated reconnect.
+    @Volatile private var forceLegacyHlsDemux = false
+    /**
+     * True if the current stream is HLS (m3u8 playlist).
+     *
+     * Escape valve for HLS-specific routing. Today it gates one thing:
+     * forcing libVLC's legacy `hls` demuxer over the newer adaptive one,
+     * to dodge a known SegmentList::updateWith assertion crash on malformed
+     * live playlists (one confirmed report on Tesla 2K TV, Android 11).
+     *
+     * Kept as a property -- not inlined -- so if we ever need a separate
+     * code path for HLS (different reconnect logic, different cache
+     * settings, different player engine even), there's one conditional to
+     * hang it on. Free until we use it.
+     */
+    private val isHlsUrl: Boolean
+        get() = lastStreamUrl?.contains(".m3u8", ignoreCase = true) == true
+    private var reconnectAttempts = 0
+    private val maxReconnectAttempts = 5
+    private var endReachedAttempts = 0
+    private val maxEndReachedAttempts = 20
+    private var lastReconnectTs = 0L
+    private val reconnectCooldownMs = 4000L
+
+    private val progressUpdateHandler = Handler(Looper.getMainLooper())
+    private var isSeeking = false
+
+    private var hasShownResumeDialog = false
+    // D-pad scrub step for VOD/series. 10s per press; change to 30_000L for 30s.
+    private val seekStepMs = 10_000L
+
+    private var epgChannelName by mutableStateOf("")
+    private var epgNowEvent by mutableStateOf<StalkerEpgEvent?>(null)
+    private var epgNextEvent by mutableStateOf<StalkerEpgEvent?>(null)
+    private var streamResolutionLabel by mutableStateOf("")
+    private val resolutionBadgeRepo by lazy { ResolutionBadgeRepository(this) }
+    private var epgBarView: android.view.View? = null
+    private val epgRefreshHandler = Handler(Looper.getMainLooper())
+    private val epgRefreshRunnable = object : Runnable {
+        override fun run() {
+            refreshEpgData()
+            epgRefreshHandler.postDelayed(this, 30_000L)
+        }
+    }
+    private val epgHideRunnable = Runnable {
+        epgBarView?.animate()?.alpha(0f)?.setDuration(400)?.start()
+    }
+
+    // ___ New simplified menu state ___________________________________________
+    private var showChannelOverlay by mutableStateOf(false)
+    private var menuFocusedPane by mutableStateOf(MenuPane.CHANNELS)
+    private var channelFocusedIndex by mutableStateOf(0)
+    // categoryFocusedIndex semantics:
+    //   -1 = search pill focused
+    //    0..filtered.size-1 = category position in the FILTERED list
+    private var categoryFocusedIndex by mutableStateOf(0)
+    private var categoryQuery by mutableStateOf("")
+    private var tvKeyboardOpen by mutableStateOf(false)
+    private var overlayOpenKeyboard by mutableStateOf(0)
+    private var overlayCloseKeyboard by mutableStateOf(0)
+    private var overlayComposeView: ComposeView? = null
+
+    /** True if any word in [name] starts with [query] (case-insensitive). */
+    private fun categoryMatches(name: String, query: String): Boolean =
+        matchesCategoryQuery(name, query)
+
+    /** Indices into allCategoryNames that pass the current category search. */
+    private val filteredCategoryIndices: List<Int>
+        get() = if (categoryQuery.isBlank()) allCategoryNames.indices.toList()
+        else allCategoryNames.indices.filter { categoryMatches(allCategoryNames[it], categoryQuery) }
+
+    private var isXtream            = false
+    private var xtreamUsername      = ""
+    private var xtreamPassword      = ""
+    private var currentCategoryId   = ""
+    private var currentCategoryName by mutableStateOf("")
+    private var allCategoryIds      by mutableStateOf(emptyList<String>())
+    private var allCategoryNames    by mutableStateOf(emptyList<String>())
+    private var currentCatIndex     by mutableStateOf(-1)
+    private var currentFilter       = ""
+    private var contentTypeName     = "IPTV"
+    private var portalId            = ""
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        enableEdgeToEdge()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        supportActionBar?.hide()
+
+        binding = ActivityPlayerBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+
+        settings = PlayerSettingsRepository(this)
+        historyRepository = HistoryRepository(this)
+        favoriteChannelsRepository = FavoriteChannelsRepository(this)
+        watchProgressRepository = WatchProgressRepository(this)
+        playerOptimizer = PlayerOptimizer(this, settings)
+
+        portalUrl = intent.getStringExtra("PORTAL_URL") ?: ""
+        macAddress = intent.getStringExtra("MAC_ADDRESS") ?: ""
+
+        if (portalUrl.isNotEmpty() && macAddress.isNotEmpty()) {
+            StalkerSession.client = StalkerClient(portalUrl, macAddress)
+        }
+
+        videoUrl = intent.getStringExtra("VIDEO_URL")
+        isVOD = videoUrl != null
+
+        isTV = packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+                packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+
+        if (!isVOD) {
+            portalId            = intent.getStringExtra("PORTAL_ID") ?: ""
+            val _categoryId     = intent.getStringExtra("CATEGORY_ID") ?: "*"
+            currentIndex        = intent.getIntExtra("CURRENT_INDEX", -1)
+            currentCategoryId   = _categoryId
+            currentCategoryName = intent.getStringExtra("CATEGORY_NAME") ?: ""
+
+            // Apply hide + parental filters to the category lists arriving
+            // from the launching screen. Without this, the player's
+            // category rail can become a bypass: locked/hidden categories
+            // would be missing from the home UI but visible inside the
+            // player. We always keep the currently-active category in the
+            // list -- the user got here legitimately (session unlock,
+            // pre-existing playback, parental state changed mid-session),
+            // and yanking it out would interrupt their stream. The filter
+            // only prevents switching TO new locked categories.
+            val intentIds   = intent.getStringArrayListExtra("CAT_IDS")   ?: emptyList()
+            val intentNames = intent.getStringArrayListExtra("CAT_NAMES") ?: emptyList()
+            val catFilterRepo = CategoryFilterRepository(this)
+            val parentalRepo  = ParentalControlsRepository(this)
+            val parentallyLocked: Set<String> = if (
+                portalId.isNotBlank() &&
+                parentalRepo.isEnabled(portalId) &&
+                !ParentalSession.isUnlocked(portalId)
+            ) parentalRepo.getLockedCategoryIds(portalId) else emptySet()
+            val keepIndices = intentIds.indices.filter { i ->
+                val id = intentIds[i]
+                val name = intentNames.getOrNull(i) ?: ""
+                id == _categoryId ||
+                        (catFilterRepo.shouldShowCategory(name) && id !in parentallyLocked)
+            }
+            allCategoryIds   = keepIndices.map { intentIds[it] }
+            allCategoryNames = keepIndices.map { intentNames[it] }
+
+            currentCatIndex     = allCategoryIds.indexOf(_categoryId)
+            categoryFocusedIndex = currentCatIndex.coerceAtLeast(0)
+            Log.d("PlayerActivity", "Categories received: ${allCategoryNames.size} after filter (idx=$currentCatIndex)")
+            currentFilter       = intent.getStringExtra("FILTER") ?: ""
+            contentTypeName     = intent.getStringExtra("CONTENT_TYPE") ?: "IPTV"
+            isXtream        = intent.getBooleanExtra("IS_XTREAM", false)
+            xtreamUsername  = intent.getStringExtra("XTREAM_USERNAME") ?: ""
+            xtreamPassword  = intent.getStringExtra("XTREAM_PASSWORD") ?: ""
+        }
+
+        if (!isVOD) {
+            // EPG bottom bar (auto-hiding info strip when menu is closed)
+            val epgBar = ComposeView(this).apply {
+                layoutParams = android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                    android.view.Gravity.BOTTOM
+                )
+                setContent {
+                    androidx.compose.material3.MaterialTheme {
+                        EpgBottomBar(
+                            channelName = epgChannelName,
+                            nowEvent = epgNowEvent,
+                            nextEvent = epgNextEvent,
+                            resolutionLabel = streamResolutionLabel
+                        )
+                    }
+                }
+            }
+            (binding.root as? ViewGroup)?.addView(epgBar)
+            epgBarView = epgBar
+
+            // New translucent two-pane channel menu
+            val overlayView = ComposeView(this).apply {
+                isFocusable = true
+                isFocusableInTouchMode = true
+                layoutParams = android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                )
+                setContent {
+                    androidx.compose.material3.MaterialTheme {
+                        ChannelMenuOverlay(
+                            visible = showChannelOverlay,
+                            isTV = isTV,
+                            channels = channels,
+                            playingIndex = currentIndex,
+                            channelFocusedIndex = channelFocusedIndex,
+                            categoryNames = allCategoryNames,
+                            categoryFocusedIndex = categoryFocusedIndex,
+                            activeCategoryIndex = currentCatIndex,
+                            categoryName = currentCategoryName,
+                            focusedPane = menuFocusedPane,
+                            globalFilter = currentFilter,
+                            categoryQuery = categoryQuery,
+                            onCategoryQueryChange = { newQuery ->
+                                categoryQuery = newQuery
+                                // After filter changes, clamp focused index to the new filtered list
+                                val filtered = filteredCategoryIndices
+                                if (filtered.isEmpty()) {
+                                    categoryFocusedIndex = -1 // stay on search pill
+                                } else if (categoryFocusedIndex >= filtered.size) {
+                                    categoryFocusedIndex = filtered.size - 1
+                                }
+                            },
+                            favoriteChannelIds = run {
+                                val favRepo = favoriteChannelsRepository
+                                val pid = portalId
+                                remember(pid) {
+                                    favRepo.getFavoriteChannels(pid).map { it.id }.toSet()
+                                }
+                            },
+                            onChannelSelected = { index ->
+                                showChannelOverlay = false
+                                if (index != currentIndex) {
+                                    currentIndex = index
+                                    updateTitle()
+                                    playIptvStream()
+                                }
+                            },
+                            onCategorySelected = { index ->
+                                if (isTV) previewCategory(index) else switchToCategory(index)
+                                // Commit: clear search so the rail shows the full list again
+                                categoryQuery = ""
+                                val newFiltered = filteredCategoryIndices
+                                val newPos = newFiltered.indexOf(index)
+                                categoryFocusedIndex = if (newPos >= 0) newPos else 0
+                            },
+                            onFavoriteToggle = { channel ->
+                                val isFav = favoriteChannelsRepository.toggleFavorite(portalId, channel)
+                                Toast.makeText(
+                                    this@PlayerActivity,
+                                    if (isFav) getString(R.string.player_toast_favourite_added)
+                                    else getString(R.string.player_toast_favourite_removed),
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
+                            onDismiss = { showChannelOverlay = false },
+                            onReturnToCategories = { returnToCategories() },
+                            onKeyboardOpenChange = { tvKeyboardOpen = it },
+                            openKeyboard = overlayOpenKeyboard,
+                            onOpenKeyboardConsumed = { overlayOpenKeyboard = 0 },
+                            closeKeyboard = overlayCloseKeyboard,
+                            onCloseKeyboardConsumed = { overlayCloseKeyboard = 0 }
+                        )
+                    }
+                }
+            }
+            (binding.root as? ViewGroup)?.addView(overlayView)
+            overlayComposeView = overlayView
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Gate PiP off for TV. Many Android TV boxes report
+            // FEATURE_PICTURE_IN_PICTURE but never present a PiP window. On
+            // those, onUserLeaveHint -> enterPipMode() puts the activity into a
+            // window-less "PiP" state: onPause early-returns (skipping teardown)
+            // and onStop never fires (the system thinks a PiP window is up), so
+            // the native player keeps decoding audio with no UI to stop it --
+            // the "sound keeps playing after I left the app" report. PiP stays
+            // enabled on phones, where it works as intended.
+            hasPipSupport = packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE) && !isTV
+        }
+
+        if (isVOD) {
+            videoId = intent.getStringExtra("VIDEO_ID") ?: videoUrl ?: ""
+
+            if (videoId?.startsWith("http") == true) {
+                videoId = videoId?.let { url ->
+                    try {
+                        val uri = Uri.parse(url)
+                        val builder = uri.buildUpon().clearQuery()
+                        uri.queryParameterNames.forEach { param ->
+                            if (param != "play_token" && param != "token") {
+                                builder.appendQueryParameter(param, uri.getQueryParameter(param))
+                            }
+                        }
+                        builder.build().toString()
+                    } catch (e: Exception) { url }
+                }
+            }
+
+            Log.d("PlayerActivity", "VOD Mode - VideoID: $videoId")
+
+            binding.nextButton.visibility = View.GONE
+            binding.prevButton.visibility = View.GONE
+            binding.rewindButton.visibility = View.VISIBLE
+            binding.fastForwardButton.visibility = View.VISIBLE
+            binding.progressContainer.visibility = View.VISIBLE
+
+        } else {
+            if (portalId.isNotEmpty()) {
+                val cache = PortalCache.get(portalId)
+                val pageMap = cache.channelPagesByGenre[currentCategoryId]
+                if (pageMap != null && pageMap.isNotEmpty()) {
+                    channels = pageMap.keys.sorted().flatMap { pageMap[it].orEmpty() }
+                    Log.d("PlayerActivity", "Loaded ${channels.size} channels (category: $currentCategoryId)")
+                } else {
+                    Log.w("PlayerActivity", "No cached channels for portal=$portalId category=$currentCategoryId")
+                }
+            }
+
+            channelFocusedIndex = currentIndex.coerceAtLeast(0)
+
+            binding.nextButton.visibility = View.GONE
+            binding.prevButton.visibility = View.GONE
+            binding.rewindButton.visibility = View.GONE
+            binding.fastForwardButton.visibility = View.GONE
+            binding.progressContainer.visibility = View.GONE
+
+            if (portalId.isNotEmpty()) {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    loadRemainingChannelPages(portalId, currentCategoryId)
+                }
+            }
+        }
+
+        setupControls()
+        initializeGestures()
+        updateTitle()
+
+        onBackPressedDispatcher.addCallback(this,
+            object : androidx.activity.OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    savePlaybackPosition()
+                    finish()
+                }
+            }
+        )
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // When the TV keyboard is showing, let keys flow naturally through the
+        // view hierarchy to the focused Compose key. Only intercept BACK to close.
+        if (!isVOD && showChannelOverlay && tvKeyboardOpen) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_BACK) {
+                overlayCloseKeyboard++
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            return onKeyDown(event.keyCode, event)
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+
+        // ___ Menu open: handle D-pad within the two panes ____________________
+        if (!isVOD && showChannelOverlay) {
+            // TV keyboard open: let Compose handle all keys natively.
+            // We only catch BACK to close the keyboard cleanly.
+            if (tvKeyboardOpen) {
+                if (keyCode == KeyEvent.KEYCODE_BACK) {
+                    overlayCloseKeyboard++
+                    return true
+                }
+                return super.onKeyDown(keyCode, event)
+            }
+
+            return when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    when (menuFocusedPane) {
+                        MenuPane.CATEGORIES -> {
+                            // -1 = search; 0..filtered.size-1 = categories
+                            // UP from category 0 -> search (-1); UP from search stays at -1
+                            if (categoryFocusedIndex > -1) categoryFocusedIndex--
+                        }
+                        MenuPane.CHANNELS -> {
+                            if (channelFocusedIndex > 0) channelFocusedIndex--
+                        }
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    when (menuFocusedPane) {
+                        MenuPane.CATEGORIES -> {
+                            val filteredSize = filteredCategoryIndices.size
+                            if (categoryFocusedIndex < filteredSize - 1) categoryFocusedIndex++
+                        }
+                        MenuPane.CHANNELS -> {
+                            if (channelFocusedIndex < channels.size - 1) channelFocusedIndex++
+                        }
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    if (menuFocusedPane == MenuPane.CHANNELS) {
+                        menuFocusedPane = MenuPane.CATEGORIES
+                        // Land directly on the filter pill so search is always
+                        // reachable in one press from the channel list.
+                        categoryFocusedIndex = -1
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    if (menuFocusedPane == MenuPane.CATEGORIES) {
+                        // From the search pill, RIGHT also crosses to channels
+                        menuFocusedPane = MenuPane.CHANNELS
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                    when (menuFocusedPane) {
+                        MenuPane.CATEGORIES -> {
+                            if (categoryFocusedIndex == -1) {
+                                // OK on search pill -> open TV keyboard
+                                overlayOpenKeyboard++
+                            } else {
+                                // Map filtered position -> original index in allCategoryNames
+                                val filtered = filteredCategoryIndices
+                                val originalIdx = filtered.getOrNull(categoryFocusedIndex)
+                                if (originalIdx != null) {
+                                    if (isTV) previewCategory(originalIdx)
+                                    else switchToCategory(originalIdx)
+                                    // Commit: clear the search filter, jump focus to channels
+                                    categoryQuery = ""
+                                    val newFiltered = filteredCategoryIndices
+                                    val newPos = newFiltered.indexOf(originalIdx)
+                                    categoryFocusedIndex = if (newPos >= 0) newPos else 0
+                                    menuFocusedPane = MenuPane.CHANNELS
+                                    channelFocusedIndex = 0
+                                }
+                            }
+                        }
+                        MenuPane.CHANNELS -> {
+                            val picked = channelFocusedIndex
+                            showChannelOverlay = false
+                            if (picked != currentIndex && picked in channels.indices) {
+                                currentIndex = picked
+                                updateTitle()
+                                playIptvStream()
+                            }
+                        }
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_BOOKMARK, KeyEvent.KEYCODE_F -> {
+                    if (menuFocusedPane == MenuPane.CHANNELS) {
+                        val ch = channels.getOrNull(channelFocusedIndex)
+                        if (ch != null) {
+                            val isFav = favoriteChannelsRepository.toggleFavorite(portalId, ch)
+                            Toast.makeText(this@PlayerActivity,
+                                if (isFav) getString(R.string.player_toast_favourite_added_format, ch.name)
+                                else getString(R.string.player_toast_favourite_removed_format, ch.name),
+                                Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    true
+                }
+                KeyEvent.KEYCODE_BACK -> {
+                    showChannelOverlay = false
+                    true
+                }
+                else -> super.onKeyDown(keyCode, event)
+            }
+        }
+
+        // ___ Menu closed: standard player controls ___________________________
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                if (!isVOD) {
+                    // If the controls bar is up and the user is on one of its
+                    // buttons (audio, subtitles, play/pause, back), OK must
+                    // activate THAT button -- not open the channel list.
+                    // Without this, the live-TV audio + subtitle pickers were
+                    // unreachable: OK always swallowed the press to open the
+                    // channel overlay (the list sliding in from the left was
+                    // exactly the symptom reported). VOD never had this problem
+                    // because its OK path (below) checks control focus first;
+                    // live TV skipped straight to opening the overlay.
+                    val focusedCtl = currentFocus
+                    if (binding.controlsContainer.visibility == View.VISIBLE &&
+                        focusedCtl != null && focusedCtl != binding.playerView
+                    ) {
+                        focusedCtl.performClick()
+                        scheduleHideControls()
+                        return true
+                    }
+                    // Default live-TV behaviour: OK opens the channel overlay.
+                    channelFocusedIndex = currentIndex.coerceAtLeast(0)
+                    categoryQuery = ""
+                    val filtered = filteredCategoryIndices
+                    val filteredPos = filtered.indexOf(currentCatIndex)
+                    categoryFocusedIndex = if (filteredPos >= 0) filteredPos else 0
+                    menuFocusedPane = MenuPane.CHANNELS
+                    showChannelOverlay = true
+                    return true
+                }
+                if (binding.controlsContainer.visibility != View.VISIBLE) {
+                    showControls(); return true
+                }
+                val focused = currentFocus
+                return when {
+                    focused == null || focused == binding.playerView -> { showControls(); true }
+                    focused == binding.backButton -> { savePlaybackPosition(); finish(); true }
+                    else -> { focused.performClick(); true }
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                // Live TV, controls hidden: left = previous channel (unchanged).
+                if (!isVOD && binding.controlsContainer.visibility != View.VISIBLE) {
+                    playPreviousChannel(); return true
+                }
+                // VOD/series: left scrubs back. If the controls are hidden we
+                // pop them up (focused on the seek bar) so the scrubber is
+                // visible and repeated left/right keep seeking -- no need to
+                // d-pad down to the seek bar first.
+                if (isVOD) {
+                    val controlsVisible = binding.controlsContainer.visibility == View.VISIBLE
+                    if (!controlsVisible) {
+                        seekVOD(-seekStepMs)
+                        showControls()
+                        binding.seekBar.post { binding.seekBar.requestFocus() }
+                        return true
+                    }
+                    if (binding.seekBar.isFocused) {
+                        seekVOD(-seekStepMs); scheduleHideControls(); return true
+                    }
+                    // Controls up, focus on a button row: let the system move
+                    // focus between buttons instead of hijacking left as a seek.
+                    scheduleHideControls()
+                    return super.onKeyDown(keyCode, event)
+                }
+                if (binding.controlsContainer.visibility == View.VISIBLE) scheduleHideControls()
+                return super.onKeyDown(keyCode, event)
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                // Live TV, controls hidden: right = next channel (unchanged).
+                if (!isVOD && binding.controlsContainer.visibility != View.VISIBLE) {
+                    playNextChannel(); return true
+                }
+                // VOD/series: right scrubs forward (same model as left).
+                if (isVOD) {
+                    val controlsVisible = binding.controlsContainer.visibility == View.VISIBLE
+                    if (!controlsVisible) {
+                        seekVOD(seekStepMs)
+                        showControls()
+                        binding.seekBar.post { binding.seekBar.requestFocus() }
+                        return true
+                    }
+                    if (binding.seekBar.isFocused) {
+                        seekVOD(seekStepMs); scheduleHideControls(); return true
+                    }
+                    scheduleHideControls()
+                    return super.onKeyDown(keyCode, event)
+                }
+                if (binding.controlsContainer.visibility == View.VISIBLE) scheduleHideControls()
+                return super.onKeyDown(keyCode, event)
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                showControls()
+                return super.onKeyDown(keyCode, event)
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (binding.controlsContainer.visibility != View.VISIBLE) {
+                    showControls(); return true
+                }
+                val current: View? = currentFocus
+                if (current != null) {
+                    val next = FocusFinder.getInstance()
+                        .findNextFocus(binding.root as ViewGroup, current, View.FOCUS_DOWN)
+                    if (next == null) { hideControls(); return true }
+                }
+                return super.onKeyDown(keyCode, event)
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                savePlaybackPosition()
+                finish()
+                return true
+            }
+        }
+
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private var isChannelSwitching = false
+
+    // Set to false before VLC release happens; checked by background
+    // coroutines (stats watchdog, reconnect logic) to bail out before
+    // calling into native libVLC on a torn-down player. The ~33% of
+    // production crashes that surfaced as SIGABRT inside libvlc.so
+    // were all racing operations on a player that had already been
+    // released -- this flag closes the window between teardown and the
+    // next native call. Volatile because it's read on background
+    // threads (Dispatchers.IO, Dispatchers.Default).
+    @Volatile private var playerActive = true
+
+    // Player instance generation. Incremented on every teardown.
+    // Background coroutines (especially the stats watchdog) capture
+    // their starting generation; any call into the libVLC native layer
+    // is gated by a check that the generation hasn't changed.
+    //
+    // Why this exists on top of playerActive: playerActive is a single
+    // bit and can flip back to true when a new player is created. A
+    // background thread that captured "playerActive=true" might run
+    // again later when playerActive is true again -- but that's a
+    // different player than the one it was watching, and any captured
+    // references to the old MediaPlayer / Media are now stale. The
+    // generation counter never reuses values, so a captured generation
+    // unambiguously identifies one specific player instance.
+    //
+    // This fixes the nativeGetStats SIGSEGV (75% of 1.3.2 crashes) by
+    // making it impossible for a stale watchdog to touch the released
+    // native media object of a previous player instance.
+    @Volatile private var playerGeneration: Long = 0
+
+    /**
+     * Detaches libVLC's AWindow from the VLCVideoLayout surface via the shared
+     * teardown executor, but never blocks the calling (main) thread for longer
+     * than [timeoutMs].
+     *
+     * detachViews() only severs the surface binding; the heavy input_Close /
+     * vlc_join lives in stop() (which also runs on the executor). So this is
+     * normally cheap. But a previous release on the executor could briefly
+     * hold the mutex detachViews needs, so we run it on the executor and wait
+     * with a timeout. If it doesn't finish in time we return anyway -- the
+     * executor will complete the detach+stop+release in order, and worst case
+     * the surface-destroy path behaves as it does today. Never worse.
+     */
+    private fun detachSurfaceBounded(mp: MediaPlayer?, tag: Long, timeoutMs: Long = 250L) {
+        if (mp == null) return
+        VlcTeardownExecutor.runDetachBounded("full detach", tag, timeoutMs) {
+            try { mp.detachViews() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun playNextChannel() {
+        if (isChannelSwitching) return
+        if (channels.isNotEmpty() && currentIndex < channels.size - 1) {
+            currentIndex++
+            channelFocusedIndex = currentIndex
+            updateTitle()
+            playIptvStream()
+        }
+    }
+
+    private fun playPreviousChannel() {
+        if (isChannelSwitching) return
+        if (channels.isNotEmpty() && currentIndex > 0) {
+            currentIndex--
+            channelFocusedIndex = currentIndex
+            updateTitle()
+            playIptvStream()
+        }
+    }
+
+    private fun previewCategory(newCatIndex: Int) {
+        if (newCatIndex !in allCategoryIds.indices) return
+        val newCatId   = allCategoryIds[newCatIndex]
+        val newCatName = allCategoryNames[newCatIndex]
+        currentCategoryId   = newCatId
+        currentCategoryName = newCatName
+        currentCatIndex     = newCatIndex
+        channelFocusedIndex = 0
+        lifecycleScope.launch(Dispatchers.Default) {
+            val cache   = PortalCache.get(portalId)
+            val pageMap = cache.channelPagesByGenre[newCatId]
+            val result  = if (pageMap != null && pageMap.isNotEmpty())
+                pageMap.keys.sorted().flatMap { pageMap[it].orEmpty() }
+            else emptyList()
+            withContext(Dispatchers.Main) { channels = result }
+            if (portalId.isNotEmpty()) {
+                withContext(Dispatchers.IO) { loadRemainingChannelPages(portalId, newCatId) }
+            }
+        }
+    }
+
+    private fun switchToCategory(newCatIndex: Int) {
+        if (newCatIndex !in allCategoryIds.indices) return
+        previewCategory(newCatIndex)
+        currentIndex = 0
+        if (channels.isNotEmpty()) {
+            updateTitle()
+            playIptvStream()
+        }
+    }
+
+    private fun returnToCategories() {
+        val data = android.content.Intent().apply { putExtra("FILTER", currentFilter) }
+        setResult(Activity.RESULT_OK, data)
+        finish()
+    }
+
+    private fun buildVlcOptions(streamType: StreamType): List<String> {
+        val options = playerOptimizer.buildVlcOptions(streamType).toMutableList()
+        val stripPrefixes = listOf("--avcodec-hw","--codec","--drop-late-frames","--aout","--audio-resampler","--no-stats","--vout")
+        options.removeAll { opt -> stripPrefixes.any { opt.startsWith(it) } }
+        val isEmulator = android.os.Build.FINGERPRINT.contains("generic") ||
+                android.os.Build.FINGERPRINT.contains("emulator") ||
+                android.os.Build.MODEL.contains("Emulator") ||
+                android.os.Build.MODEL.contains("Android SDK")
+        val voutOption: String? = when {
+            isEmulator -> null
+            // VOD: leave libVLC to pick its default (OpenGL) vout.
+            // android_display is the legacy SurfaceFlinger renderer -- it
+            // can't blit 10-bit HEVC output from the hardware decoder,
+            // which is what most 4K content (and all 4K HDR content) uses.
+            // Symptom is audio plays but video is a black screen. The GL
+            // vout handles 10-bit fine via textures, so VOD gets the
+            // default and 4K HDR movies actually render.
+            isVOD -> null
+            // Live IPTV: force android_display. The default OpenGL vout
+            // triggers GPU driver crashes on cheap Android TV boxes with
+            // Mali drivers (CHiQ, Hisense, etc) during channel switching.
+            // android_display uses SurfaceFlinger directly -- fewer code
+            // paths, much higher compatibility. Live IPTV streams are
+            // almost always 1080p or lower H.264, well within what
+            // android_display can render, so we don't lose anything.
+            else -> "--vout=android_display"
+        }
+        options.addAll(listOfNotNull(
+            "--http-reconnect","--no-sub-autodetect-file","--no-media-library",
+            "--clock-jitter=0","--clock-synchro=0",
+            if (isEmulator) "--avcodec-hw=none" else "--avcodec-hw=any",
+            "--aout=android_audiotrack","--verbose=-1","--log-verbose=-1",
+            voutOption
+        ))
+        return options
+    }
+
+    private var isStatsPollingActive = false
+
+    // Last time we saw a successful Buffering event with buffering == 100.
+    // Updated from the MediaPlayer.Event.Buffering handler on the main
+    // thread. Read by the watchdog (no native calls).
+    @Volatile private var lastFullBufferingTs = 0L
+
+    /**
+     * Stall-detection watchdog. Runs on a background coroutine, polls
+     * once per second, and triggers softReconnect() if the stream has
+     * been stuck (no full-buffer event in 12+ seconds while still
+     * supposedly playing).
+     *
+     * Rewritten in 1.3.3 to remove the native stats poll
+     * (mp.media?.stats) that was the source of the nativeGetStats
+     * SIGSEGV crash (75% of 1.3.2 crashes). Detection now relies
+     * entirely on:
+     *   - currentBuffering: updated from MediaPlayer.Event.Buffering
+     *     (main thread, no race)
+     *   - lastFullBufferingTs: timestamp of the last buffering=100 event
+     *   - playerGeneration: ensures we bail before touching native state
+     *
+     * The generation guard makes the watchdog inert if teardown happened
+     * mid-iteration: even if mediaPlayer hasn't been nulled yet, the
+     * captured generation won't match and the loop exits.
+     *
+     * Behavior change vs 1.3.2:
+     *   - We no longer detect "no decoded frames" directly. Instead we
+     *     detect "buffering hasn't completed for 12s". In practice the
+     *     two are tightly correlated -- a stalled stream will either
+     *     show buffering < 100 or stop receiving Playing events. The
+     *     buffer-stuck detection covers both.
+     *   - We don't read decoded-frame counts, so we can't distinguish
+     *     "actively decoding low-bitrate stream" from "stuck buffer that
+     *     happens to be 100% full of stale data". The latter is rare.
+     */
+    private fun startStatsPolling() {
+        if (isStatsPollingActive) return
+        isStatsPollingActive = true
+        val myGen = playerGeneration   // capture the generation we're watching
+        lastFullBufferingTs = System.currentTimeMillis()
+        lifecycleScope.launch(Dispatchers.Default) {
+            try {
+                while (playerActive && playerGeneration == myGen) {
+                    // No native dereferencing in this loop. Everything we
+                    // read is either pure Kotlin state (currentBuffering,
+                    // lastFullBufferingTs, isChannelSwitching, isVOD) or
+                    // accessed via methods we already know to be safe in
+                    // the racing case.
+                    val now = System.currentTimeMillis()
+                    val timeSinceFullBuffer = now - lastFullBufferingTs
+
+                    // If buffering is currently at 100 (good), reset the
+                    // stall timer continuously. The Buffering event
+                    // handler also updates this, but we double-check here
+                    // in case events aren't firing.
+                    if (currentBuffering >= 100f) {
+                        lastFullBufferingTs = now
+                    }
+
+                    // Stall detection: live streams only, not during
+                    // channel switches, only after we've been running long
+                    // enough that a stall is meaningful.
+                    if (!isVOD && !isChannelSwitching && timeSinceFullBuffer > 12_000L) {
+                        Log.w("PlayerActivity",
+                            "Watchdog: no full buffer event in ${timeSinceFullBuffer}ms -> reconnect")
+                        // Re-check generation before dispatching the
+                        // reconnect; softReconnect has its own guards but
+                        // there's no harm in failing fast here.
+                        if (playerGeneration != myGen) break
+                        withContext(Dispatchers.Main) {
+                            if (playerGeneration == myGen) softReconnect()
+                        }
+                        // Give the reconnect time to settle before
+                        // re-evaluating. Reset the stall timer so we don't
+                        // immediately re-trigger.
+                        lastFullBufferingTs = System.currentTimeMillis()
+                        delay(5_000)
+                        continue
+                    }
+
+                    // Update the UI stream-health badge based on the
+                    // pure-Kotlin signals we have. No more "frames per
+                    // second" granularity, just a coarse buffering view.
+                    val health = when {
+                        currentBuffering >= 100f -> StreamHealthState.Excellent
+                        currentBuffering > 0f    -> StreamHealthState.LowBitrate
+                        else                     -> StreamHealthState.NoSignal
+                    }
+                    streamInfoViewModel.update(
+                        StreamInfo(
+                            health = health,
+                            resolution = "Unknown",
+                            bitrate = 0,
+                            fps = 0,
+                            codec = ""
+                        )
+                    )
+
+                    delay(1_000)
+                }
+            } finally {
+                isStatsPollingActive = false
+            }
+        }
+    }
+
+    private fun softReconnect() {
+        val url = lastStreamUrl ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastReconnectTs < reconnectCooldownMs) return
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            runOnUiThread { Toast.makeText(this, getString(R.string.player_stream_unavailable), Toast.LENGTH_SHORT).show(); finish() }
+            return
+        }
+        reconnectAttempts++; lastReconnectTs = now
+        Log.w("PlayerActivity", "Soft reconnect #$reconnectAttempts")
+        lifecycleScope.launch(Dispatchers.IO) {
+            // Bail if the player is already torn down. The Media constructor
+            // dereferences libVLC in native code, which SIGABRTs if released.
+            if (!playerActive) return@launch
+            val vlc = libVLC ?: return@launch
+            try { mediaPlayer?.stop() } catch (_: Exception) {}
+            delay(200)
+            if (!playerActive) return@launch
+            val media = try {
+                Media(vlc, Uri.parse(url)).apply {
+                    addOption(":http-user-agent=${lastStreamUserAgent ?: "Mozilla/5.0 (QtEmbedded; MAG254 stb) WebKit"}")
+                    addOption(":http-referrer=${lastStreamReferrer ?: portalUrl}")
+                    // Only force legacy HLS demux if this stream was flagged
+                    // as needing it (set by the EncounteredError handler).
+                    if (isHlsUrl && forceLegacyHlsDemux) addOption(":demux=hls")
+                }
+            } catch (e: Exception) {
+                Log.w("PlayerActivity", "softReconnect: Media creation failed: ${e.message}")
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                val mp = mediaPlayer
+                if (isDestroyed || isFinishing || !playerActive || mp == null) {
+                    media.release(); return@withContext
+                }
+                try {
+                    if (mp.vlcVout?.areViewsAttached() == false)
+                        mp.attachViews(binding.playerView, null, false, false)
+                    mp.media = media
+                    media.release()
+                    mp.play()
+                } catch (e: Exception) {
+                    Log.w("PlayerActivity", "softReconnect: playback failed: ${e.message}")
+                } finally {
+                    // Always exactly one release: balances the Media() constructor's
+                    // initial refcount; the player retains its own ref via mp.media = media
+                    try { media.release() } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    private fun liveEndReachedReconnect() {
+        val url = lastStreamUrl ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastReconnectTs < reconnectCooldownMs) return
+        endReachedAttempts++; lastReconnectTs = now
+        if (endReachedAttempts > maxEndReachedAttempts) {
+            runOnUiThread { Toast.makeText(this, getString(R.string.player_stream_interrupted), Toast.LENGTH_SHORT).show() }
+            endReachedAttempts = 0
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            delay(1000)
+            // Same release-race protection as softReconnect.
+            if (!playerActive) return@launch
+            val vlc = libVLC ?: return@launch
+            try { mediaPlayer?.stop() } catch (_: Exception) {}
+            delay(200)
+            if (!playerActive) return@launch
+            val media = try {
+                Media(vlc, Uri.parse(url)).apply {
+                    addOption(":http-user-agent=${lastStreamUserAgent ?: "Mozilla/5.0 (QtEmbedded; MAG254 stb) WebKit"}")
+                    addOption(":http-referrer=${lastStreamReferrer ?: portalUrl}")
+                    // Same fallback-flag gating as softReconnect, so the
+                    // demuxer choice stays consistent across all reconnect paths.
+                    if (isHlsUrl && forceLegacyHlsDemux) addOption(":demux=hls")
+                }
+            } catch (e: Exception) {
+                Log.w("PlayerActivity", "liveEndReachedReconnect: Media creation failed: ${e.message}")
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                val mp = mediaPlayer
+                if (isDestroyed || isFinishing || !playerActive || mp == null) {
+                    media.release(); return@withContext
+                }
+                try {
+                    if (mp.vlcVout?.areViewsAttached() == false)
+                        mp.attachViews(binding.playerView, null, false, false)
+                    mp.media = media
+                    media.release()
+                    mp.play()
+                } catch (e: Exception) {
+                    Log.w("PlayerActivity", "liveEndReachedReconnect: playback failed: ${e.message}")
+                    try { media.release() } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    private var lastVlcOptionsFingerprint: String = ""
+
+    private suspend fun initializePlayer(streamType: StreamType) {
+        isStatsPollingActive = false
+        val newOptions  = buildVlcOptions(streamType)
+        val fingerprint = newOptions.joinToString("|")
+        if (libVLC != null && fingerprint == lastVlcOptionsFingerprint) {
+            val oldMp = mediaPlayer
+            // detachViews() acquires libVLC's internal mutex which can be held by
+            // a background release thread from a previous channel switch. Calling
+            // it from the main thread caused ANRs ("blocked on futex_wait" inside
+            // vlc_mutex_lock). It's safe to call from any thread, so push it to IO.
+            withContext(Dispatchers.IO) { try { oldMp?.detachViews() } catch (_: Exception) {} }
+            val newMp = withContext(Dispatchers.IO) { MediaPlayer(libVLC).apply { setEventListener(this@PlayerActivity) } }
+            withContext(Dispatchers.Main) { mediaPlayer = newMp }
+            // Release the OLD player on the shared serialized teardown thread.
+            val swTag = VlcTeardownExecutor.nextTag()
+            VlcTeardownExecutor.submit("channel-switch release", swTag) {
+                try { oldMp?.setEventListener(null) } catch (_: Throwable) {}
+                try { oldMp?.stop()                  } catch (_: Throwable) {}
+                try { oldMp?.release()               } catch (_: Throwable) {}
+            }
+        } else {
+            val oldMp  = mediaPlayer
+            val oldVlc = libVLC
+            // Null out the references on the main thread (state change) but do
+            // the actual detachViews on IO -- same reasoning as above.
+            withContext(Dispatchers.Main) {
+                mediaPlayer = null; libVLC = null
+            }
+            withContext(Dispatchers.IO) { try { oldMp?.detachViews() } catch (_: Exception) {} }
+            val (newVlc, newMp) = withContext(Dispatchers.IO) {
+                val vlc = LibVLC(this@PlayerActivity, newOptions)
+                val mp  = MediaPlayer(vlc).apply { setEventListener(this@PlayerActivity) }
+                vlc to mp
+            }
+            withContext(Dispatchers.Main) {
+                libVLC = newVlc; mediaPlayer = newMp; lastVlcOptionsFingerprint = fingerprint
+            }
+            // Release the OLD player + lib on the shared serialized teardown thread.
+            val swTag = VlcTeardownExecutor.nextTag()
+            VlcTeardownExecutor.submit("channel-switch release(+vlc)", swTag) {
+                try { oldMp?.setEventListener(null) } catch (_: Throwable) {}
+                try { oldMp?.stop()                  } catch (_: Throwable) {}
+                try { oldMp?.release()               } catch (_: Throwable) {}
+                try { oldVlc?.release()              } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun setupControls() {
+        binding.backButton.setOnClickListener { savePlaybackPosition(); finish() }
+        binding.playPauseButton.setOnClickListener {
+            mediaPlayer?.let {
+                if (it.isPlaying) { it.pause(); showControls() } else { it.play(); hideControls() }
+            }
+        }
+        binding.prevButton.setOnClickListener { playPreviousChannel() }
+        binding.nextButton.setOnClickListener { playNextChannel() }
+        binding.rewindButton.setOnClickListener { seekVOD(-10000) }
+        binding.fastForwardButton.setOnClickListener { seekVOD(10000) }
+        binding.subtitlesButton.setOnClickListener { showSubtitleDialog() }
+        binding.audioButton.setOnClickListener { showAudioTrackDialog() }
+        binding.controlsContainer.alpha = 1f
+        binding.controlsContainer.visibility = View.INVISIBLE
+        binding.seekBar.max = 1000
+        binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                if (fromUser) mediaPlayer?.let { if (it.length > 0) it.time = it.length * p / 1000L }
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) { isSeeking = true; hideControlsHandler.removeCallbacksAndMessages(null) }
+            override fun onStopTrackingTouch(s: SeekBar?) { isSeeking = false; scheduleHideControls() }
+        })
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun enterPipMode() {
+        try {
+            enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build())
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.player_pip_not_available), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (isInPictureInPictureMode) {
+            binding.controlsContainer.visibility = View.GONE
+            showChannelOverlay = false
+            hideControlsHandler.removeCallbacksAndMessages(null)
+        } else {
+            binding.controlsContainer.visibility = View.VISIBLE
+            showControls()
+        }
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (hasPipSupport && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            if (mediaPlayer?.isPlaying == true) enterPipMode()
+    }
+
+    private fun savePlaybackPosition() {
+        if (!isVOD || videoId == null) return
+        val position = mediaPlayer?.time ?: 0
+        val duration = mediaPlayer?.length ?: 0
+        if (duration > 0) {
+            val videoIdSnapshot = videoId!!
+            val seriesId     = intent.getStringExtra("SERIES_ID")
+            val seriesName   = intent.getStringExtra("SERIES_NAME") ?: getString(R.string.home_menu_series)
+            val seriesPoster = intent.getStringExtra("SERIES_POSTER")
+            lifecycleScope.launch(Dispatchers.IO) {
+                if (seriesId != null && seriesId.isNotEmpty()) {
+                    watchProgressRepository.saveSeriesProgress(
+                        episodeId = videoIdSnapshot, seriesId = seriesId,
+                        seriesName = seriesName, seriesPoster = seriesPoster,
+                        position = position, duration = duration
+                    )
+                } else {
+                    watchProgressRepository.saveProgress(videoIdSnapshot, position, duration)
+                }
+            }
+        }
+    }
+
+    private fun checkAndResumePlayback() {
+        if (!isVOD || videoId == null || hasShownResumeDialog) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            val progress = watchProgressRepository.getProgress(videoId!!)
+            if (progress != null) {
+                val (savedPosition, savedDuration) = progress
+                withContext(Dispatchers.Main) { hasShownResumeDialog = true; showResumeDialog(savedPosition, savedDuration) }
+            }
+        }
+    }
+
+    private fun showResumeDialog(savedPosition: Long, savedDuration: Long) {
+        val percentage = ((savedPosition * 100) / savedDuration).toInt()
+        val contentTitle = if (isVOD) intent.getStringExtra("TITLE")
+        else if (channels.isNotEmpty() && currentIndex in channels.indices) channels[currentIndex].name
+        else null
+        try {
+            val composeView = androidx.compose.ui.platform.ComposeView(this)
+            composeView.setViewCompositionStrategy(
+                androidx.compose.ui.platform.ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            composeView.setContent {
+                val showDialog = androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(true) }
+                if (showDialog.value) {
+                    androidx.compose.material3.MaterialTheme {
+                        fun dismiss() {
+                            showDialog.value = false
+                            Handler(Looper.getMainLooper()).postDelayed(
+                                { (window.decorView as? ViewGroup)?.removeView(composeView) }, 100)
+                        }
+                        ResumePlaybackDialog(
+                            timePosition = formatTime(savedPosition),
+                            percentage = percentage,
+                            title = contentTitle,
+                            onResume = { mediaPlayer?.time = savedPosition; dismiss() },
+                            onStartOver = { videoId?.let { watchProgressRepository.removeProgress(it) }; dismiss() }
+                        )
+                    }
+                }
+            }
+            (window.decorView as ViewGroup).addView(composeView)
+        } catch (e: Exception) {
+            AlertDialog.Builder(this)
+                .setTitle(getString(R.string.player_resume_title))
+                .setMessage(getString(R.string.player_resume_message, formatTime(savedPosition), percentage))
+                .setPositiveButton(getString(R.string.player_resume_button)) { _, _ -> mediaPlayer?.time = savedPosition }
+                .setNegativeButton(getString(R.string.player_start_over_button)) { _, _ -> videoId?.let { watchProgressRepository.removeProgress(it) } }
+                .setCancelable(true).show()
+        }
+    }
+
+    private fun seekVOD(delta: Long) {
+        mediaPlayer?.let { mp ->
+            val newTime = (mp.time + delta).coerceIn(0, mp.length)
+            mp.time = newTime
+            binding.currentTime.text = formatTime(newTime)
+            if (mp.length > 0) binding.seekBar.progress = (newTime * 1000L / mp.length).toInt()
+        }
+    }
+
+    private fun showSubtitleDialog() {
+        val spuTracks = mediaPlayer?.spuTracks ?: emptyArray()
+        if (spuTracks.isEmpty()) { Toast.makeText(this, getString(R.string.player_no_subtitles_available), Toast.LENGTH_SHORT).show(); return }
+        val names = spuTracks.map { it.name }.toMutableList().also { it.add(0, getString(R.string.player_subtitles_disable)) }
+        val checked = spuTracks.indexOfFirst { it.id == (mediaPlayer?.spuTrack ?: -1) } + 1
+        AlertDialog.Builder(this).setTitle(getString(R.string.player_select_subtitles_title))
+            .setSingleChoiceItems(names.toTypedArray(), checked) { d, w ->
+                mediaPlayer?.spuTrack = if (w == 0) -1 else spuTracks[w - 1].id; d.dismiss()
+            }.setNegativeButton(getString(R.string.dialog_cancel), null).show()
+    }
+
+    private fun showAudioTrackDialog() {
+        val mp = mediaPlayer ?: return
+        val audioTracks = mp.audioTracks ?: emptyArray()
+        if (audioTracks.isEmpty()) { Toast.makeText(this, getString(R.string.player_no_audio_tracks), Toast.LENGTH_SHORT).show(); return }
+        val checked = audioTracks.indexOfFirst { it.id == (mp.audioTrack ?: -1) }
+        AlertDialog.Builder(this).setTitle(getString(R.string.player_audio_tracks_title))
+            .setSingleChoiceItems(audioTracks.map { it.name }.toTypedArray(), checked) { d, w ->
+                mp.audioTrack = audioTracks[w].id; d.dismiss()
+            }.setNegativeButton(getString(R.string.dialog_cancel), null).show()
+    }
+
+    private fun updateTitle() {
+        val title = if (isVOD) intent.getStringExtra("TITLE") ?: getString(R.string.player_vod_fallback_title)
+        else if (channels.isNotEmpty() && currentIndex in channels.indices) channels[currentIndex].name
+        else getString(R.string.player_live_tv_title)
+        binding.mediaTitleText?.text = title
+        if (!isVOD) refreshEpgBar()
+    }
+
+    private fun refreshEpgData() {
+        if (isVOD || channels.isEmpty() || currentIndex !in channels.indices) return
+        val channel = channels[currentIndex]
+        lifecycleScope.launch(Dispatchers.Default) {
+            val (now, next) = EpgRepository.getBestEpg(channel)
+            withContext(Dispatchers.Main) {
+                epgChannelName = channel.name; epgNowEvent = now; epgNextEvent = next
+            }
+        }
+    }
+
+    private fun refreshEpgBar() {
+        if (isVOD || channels.isEmpty() || currentIndex !in channels.indices) return
+        refreshEpgData()
+        epgBarView?.animate()?.cancel()
+        epgBarView?.alpha = 1f
+        epgRefreshHandler.removeCallbacks(epgHideRunnable)
+        epgRefreshHandler.postDelayed(epgHideRunnable, 7_000L)
+    }
+
+    private var screenWidth = 0
+    private var scaleGestureDetector: android.view.ScaleGestureDetector? = null
+    private var currentAspectRatio = AspectRatio.FIT
+    private var swipeStartX = 0f
+    private var swipeCommitted = false
+
+    private enum class AspectRatio { FIT, FILL, ZOOM_16_9 }
+
+    private fun initializeGestures() {
+        screenWidth = resources.displayMetrics.widthPixels
+        val hud = android.widget.TextView(this).apply {
+            textSize = 18f; setTextColor(android.graphics.Color.WHITE); setPadding(32, 16, 32, 16)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#CC000000")); cornerRadius = 16f
+            }
+            visibility = View.GONE; gravity = android.view.Gravity.CENTER
+        }
+        (binding.root as? ViewGroup)?.addView(hud, android.widget.FrameLayout.LayoutParams(
+            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT, 120
+        ).also { it.gravity = android.view.Gravity.CENTER })
+        fun showHud(text: String) {
+            hud.text = text; hud.visibility = View.VISIBLE; hud.animate().cancel(); hud.alpha = 1f
+            hud.postDelayed({ hud.animate().alpha(0f).setDuration(400).withEndAction { hud.visibility = View.GONE }.start() }, 800)
+        }
+        scaleGestureDetector = android.view.ScaleGestureDetector(this,
+            object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScaleEnd(detector: android.view.ScaleGestureDetector) {
+                    currentAspectRatio = when (currentAspectRatio) {
+                        AspectRatio.FIT -> AspectRatio.FILL; AspectRatio.FILL -> AspectRatio.ZOOM_16_9; AspectRatio.ZOOM_16_9 -> AspectRatio.FIT
+                    }
+                    when (currentAspectRatio) {
+                        AspectRatio.FIT       -> { mediaPlayer?.setAspectRatio(null); showHud(getString(R.string.player_aspect_fit)) }
+                        AspectRatio.FILL      -> { mediaPlayer?.setAspectRatio("${screenWidth}:${resources.displayMetrics.heightPixels}"); showHud(getString(R.string.player_aspect_fill)) }
+                        AspectRatio.ZOOM_16_9 -> { mediaPlayer?.setAspectRatio("16:9"); showHud(getString(R.string.player_aspect_16_9)) }
+                    }
+                }
+            })
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if (!isVOD) {
+                    if (showChannelOverlay) showChannelOverlay = false
+                    else {
+                        channelFocusedIndex = currentIndex.coerceAtLeast(0)
+                        categoryQuery = ""
+                        val filtered = filteredCategoryIndices
+                        val filteredPos = filtered.indexOf(currentCatIndex)
+                        categoryFocusedIndex = if (filteredPos >= 0) filteredPos else 0
+                        menuFocusedPane = MenuPane.CHANNELS
+                        showChannelOverlay = true
+                    }
+                } else {
+                    if (binding.controlsContainer.visibility == View.VISIBLE) hideControls() else showControls()
+                }
+                return true
+            }
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (!isVOD) return true
+                val third = screenWidth / 3f
+                when {
+                    e.x < third     -> { seekVOD(-10_000); showHud("<< -10s") }
+                    e.x > third * 2 -> { seekVOD(10_000);  showHud(">> +10s") }
+                    else            -> binding.playPauseButton.performClick()
+                }
+                return true
+            }
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (isVOD || e1 == null) return false
+                val deltaX = e2.x - e1.x; val deltaY = e2.y - e1.y
+                if (Math.abs(deltaX) < Math.abs(deltaY) * 1.5f) return false
+                if (Math.abs(velocityX) < 400f) return false
+                if (deltaX < 0) playNextChannel() else playPreviousChannel()
+                return true
+            }
+        })
+        binding.playerView.setOnTouchListener { _, event ->
+            scaleGestureDetector?.onTouchEvent(event)
+            gestureDetector.onTouchEvent(event)
+            true
+        }
+    }
+
+    private fun showControls() {
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        binding.controlsContainer.visibility = View.VISIBLE
+        binding.controlsContainer.animate().alpha(1f).setDuration(150).withEndAction {
+            val focused = currentFocus
+            val seekbarOrTrack = focused == binding.seekBar || focused == binding.subtitlesButton || focused == binding.audioButton
+            if (!seekbarOrTrack) binding.playPauseButton.requestFocus()
+        }.start()
+        scheduleHideControls()
+    }
+
+    private fun scheduleHideControls() {
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        if (!isSeeking) hideControlsHandler.postDelayed({ hideControls() }, 5000)
+    }
+
+    private fun hideControls() {
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        currentFocus?.clearFocus()
+        binding.playerView.requestFocus()
+        binding.controlsContainer.animate().alpha(0f).setDuration(150)
+            .withEndAction { binding.controlsContainer.visibility = View.INVISIBLE }.start()
+    }
+
+    private suspend fun loadRemainingChannelPages(portalId: String, categoryId: String) {
+        val cache = PortalCache.get(portalId)
+        val pageMap = cache.getOrPutChannelPage(categoryId)
+        if (pageMap.isNotEmpty()) {
+            withContext(Dispatchers.Main) { refreshChannelsFromCache(portalId, categoryId) }
+            return
+        }
+        if (isXtream) {
+            try {
+                val client = XtreamClient(portalUrl, xtreamUsername, xtreamPassword)
+                val fetched = client.getLiveStreams(categoryId)
+                if (fetched.isNotEmpty()) {
+                    pageMap[1] = fetched
+                    withContext(Dispatchers.Main) { refreshChannelsFromCache(portalId, categoryId) }
+                }
+            } catch (e: Exception) { Log.w("PlayerActivity", "Xtream loadChannels failed: ${e.message}") }
+            return
+        }
+        try {
+            val sc = StalkerSession.client
+            sc.handshake(force = false)
+            var page = (pageMap.keys.maxOrNull() ?: 0) + 1
+            var keepGoing = true
+            while (keepGoing) {
+                val result = sc.getChannelsPage(categoryId, page, limit = 2000)
+                val fetched = result.channels
+                if (fetched.isEmpty()) { keepGoing = false } else {
+                    pageMap[page] = fetched
+                    if (result.totalItems > 0) cache.channelCountByGenre[categoryId] = result.totalItems
+                    withContext(Dispatchers.Main) { refreshChannelsFromCache(portalId, categoryId) }
+                    val totalSoFar = pageMap.values.sumOf { it.size }
+                    val total = result.totalItems.takeIf { it > 0 } ?: Int.MAX_VALUE
+                    keepGoing = totalSoFar < total && fetched.isNotEmpty()
+                    page++
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("PlayerActivity", "loadRemainingChannelPages failed: ${e.message}")
+            withContext(Dispatchers.Main) { refreshChannelsFromCache(portalId, categoryId) }
+        }
+    }
+
+    private fun refreshChannelsFromCache(portalId: String, categoryId: String) {
+        lifecycleScope.launch(Dispatchers.Default) {
+            val cache = PortalCache.get(portalId)
+            val pageMap = cache.channelPagesByGenre[categoryId] ?: return@launch
+            val all = pageMap.keys.sorted().flatMap { pageMap[it].orEmpty() }
+            if (all.size > channels.size) {
+                withContext(Dispatchers.Main) {
+                    channels = all
+                    Log.d("PlayerActivity", "Channel list updated: ${channels.size} total")
+                }
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        mainPlayerActive.value = true
+        playerActive = true
+        playerGeneration++
+        if (!isVOD) { epgRefreshHandler.post(epgRefreshRunnable); refreshEpgData() }
+        // Only (re)start playback if the player was actually torn down. If
+        // we're returning from PiP, mediaPlayer is still alive and we should
+        // leave it alone -- otherwise we'd kill-and-recreate for nothing and
+        // the user would see a brief stutter.
+        if (mediaPlayer == null) {
+            if (isVOD) playVodStream(intent.getIntExtra("PORTAL_RESOLUTION", 0), intent.getStringExtra("PORTAL_CODEC"))
+            else playIptvStream()
+        }
+    }
+
+    private fun playVodStream(portalResolution: Int?, portalCodec: String?) {
+        binding.progressBar.visibility = View.VISIBLE
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val streamType = StreamTypeDetector.detect(isVOD, portalResolution, portalCodec, videoUrl ?: "")
+                initializePlayer(streamType)
+
+                val media = Media(libVLC, Uri.parse(videoUrl)).apply {
+                    addOption(":http-user-agent=Mozilla/5.0 (QtEmbedded; MAG254 stb) WebKit")
+                    addOption(":http-referrer=$portalUrl")
+                }
+                withContext(Dispatchers.Main) {
+                    streamResolutionLabel = ""
+                    startPlayback(media)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@PlayerActivity, getString(R.string.player_playback_failed, e.message), Toast.LENGTH_LONG).show()
+                    finish()
+                }
+            }
+        }
+    }
+
+    private fun playIptvStream() {
+        if (currentIndex == -1 || channels.isEmpty()) {
+            Toast.makeText(this, getString(R.string.player_invalid_channel_data), Toast.LENGTH_LONG).show()
+            finish(); return
+        }
+        val indexSnapshot = currentIndex
+        if (indexSnapshot !in channels.indices) return
+        isChannelSwitching = true
+        binding.progressBar.visibility = View.VISIBLE
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val channel = channels[indexSnapshot]
+                val historyKey = portalId.ifBlank { macAddress }
+                historyRepository.addRecentlyWatched(historyKey, channel)
+                val isDirectUrl = channel.cmd.startsWith("http://") || channel.cmd.startsWith("https://") ||
+                        channel.cmd.startsWith("rtsp://") || channel.cmd.startsWith("rtmp://")
+                val finalUrl = if (isDirectUrl) channel.cmd
+                else {
+                    val resolved = StalkerSession.client.resolveStreamUrl(channel.cmd)
+                    if (resolved == null) {
+                        withContext(Dispatchers.Main) { Toast.makeText(this@PlayerActivity, getString(R.string.player_failed_resolve_url), Toast.LENGTH_LONG).show() }
+                        return@launch
+                    }
+                    if (resolved.contains("localhost")) {
+                        Uri.parse(portalUrl).let { base ->
+                            val portPart = if (base.port != -1) ":${base.port}" else ""
+                            val resolvedUri = Uri.parse(resolved)
+                            val query = resolvedUri.encodedQuery
+                            val queryPart = if (!query.isNullOrBlank()) "?$query" else ""
+                            "${base.scheme}://${base.host}$portPart${resolvedUri.encodedPath}$queryPart"
+                        }
+                    } else resolved
+                }
+                val streamType = StreamTypeDetector.detect(!isVOD, null, null, finalUrl)
+                initializePlayer(streamType)
+                val isXtreamUrl = finalUrl.matches(Regex("https?://[^/]+/[^/]+/[^/]+/\\d+.*"))
+                val ua = if (isXtreamUrl) "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36"
+                else "Mozilla/5.0 (QtEmbedded; MAG254 stb) WebKit"
+                val ref = if (isXtreamUrl) "" else portalUrl
+                val credRegex = Regex("""^(https?://)([^@\s]+)@(.+)$""")
+                val credMatch = credRegex.find(finalUrl)
+                val vlcUrl = if (credMatch != null) credMatch.groupValues[1] + credMatch.groupValues[3] else finalUrl
+                val vlcAuth = if (credMatch != null) {
+                    val userInfo = credMatch.groupValues[2]
+                    val (vlcUser, vlcPass) = if (userInfo.contains(":"))
+                        userInfo.substringBefore(":") to userInfo.substringAfter(":")
+                    else userInfo to ""
+                    ":http-user=${vlcUser}" to ":http-pwd=${vlcPass}"
+                } else null
+                // HLS detection has to happen here off finalUrl because
+                // lastStreamUrl (and therefore isHlsUrl) isn't set yet --
+                // that assignment lives in the withContext(Main) block below.
+                val isHls = finalUrl.contains(".m3u8", ignoreCase = true)
+                val media = Media(libVLC, Uri.parse(vlcUrl)).apply {
+                    addOption(":http-user-agent=$ua"); addOption(":http-referrer=$ref")
+                    if (isXtreamUrl) addOption(":network-caching=3000")
+                    if (vlcAuth != null) { addOption(vlcAuth.first); addOption(vlcAuth.second) }
+                    // HLS demuxer: default to adaptive (no force) so providers
+                    // whose playlists the legacy demuxer can't parse still play
+                    // first try. Only force the legacy demuxer if a previous
+                    // attempt at THIS stream soft-failed and flipped the flag
+                    // (reset to false on each new channel just below). The
+                    // legacy demuxer dodges the Tesla SegmentList::updateWith
+                    // SIGABRT but breaks providers like Tomek's, so it's now a
+                    // fallback rather than the default.
+                    if (isHls && forceLegacyHlsDemux) addOption(":demux=hls")
+                }
+                withContext(Dispatchers.Main) {
+                    lastStreamUrl = finalUrl; lastStreamUserAgent = ua; lastStreamReferrer = ref
+                    reconnectAttempts = 0; endReachedAttempts = 0; lastReconnectTs = 0L
+                    // New channel -> start on the adaptive demuxer. The
+                    // EncounteredError handler flips this true if this stream
+                    // turns out to need the legacy demuxer.
+                    forceLegacyHlsDemux = false
+                    isChannelSwitching = false
+                    streamResolutionLabel = ""  // reset -- Vout event will repopulate
+                    startPlayback(media)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isChannelSwitching = false
+                    Toast.makeText(this@PlayerActivity, getString(R.string.player_playback_failed, e.message), Toast.LENGTH_LONG).show()
+                }
+            } finally { isChannelSwitching = false }
+        }
+    }
+
+    private fun startPlayback(media: Media) {
+        binding.playerView.post {
+            if (isDestroyed || isFinishing) { media.release(); return@post }
+            mediaPlayer?.media = media; mediaPlayer?.spuTrack = -1
+            if (mediaPlayer?.vlcVout?.areViewsAttached() == false)
+                mediaPlayer?.attachViews(binding.playerView, null, false, false)
+            mediaPlayer?.play(); media.release()
+        }
+    }
+
+    private val updateProgressRunnable = object : Runnable {
+        override fun run() {
+            mediaPlayer?.let {
+                if (!isSeeking && it.length > 0) {
+                    binding.seekBar.progress = (it.time * 1000L / it.length).toInt()
+                    binding.currentTime.text = formatTime(it.time)
+                }
+            }
+            progressUpdateHandler.postDelayed(this, 1000)
+        }
+    }
+
+    override fun onEvent(event: MediaPlayer.Event) {
+        val mp = mediaPlayer ?: return
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            when (event.type) {
+                MediaPlayer.Event.Buffering -> {
+                    currentBuffering = event.buffering
+                    // Stamp the timestamp so the watchdog can detect stalls
+                    // without ever calling into libVLC. See startStatsPolling.
+                    if (event.buffering >= 100f) {
+                        lastFullBufferingTs = System.currentTimeMillis()
+                    }
+                }
+                MediaPlayer.Event.Playing -> {
+                    reconnectAttempts = 0; endReachedAttempts = 0; lastReconnectTs = 0L
+                    lastDecodedFrames = 0; lastDecodedUpdateTs = System.currentTimeMillis()
+                    if (!isVOD) startStatsPolling()
+                    binding.progressBar.visibility = View.GONE
+                    binding.playPauseButton.setImageResource(R.drawable.ic_pause)
+                    hideControls()
+                    if (isVOD) {
+                        val duration = mediaPlayer?.length ?: 0
+                        binding.totalDuration.text = formatTime(duration)
+                        progressUpdateHandler.post(updateProgressRunnable)
+                        if (!hasShownResumeDialog && (mediaPlayer?.time ?: 0) < 2000) checkAndResumePlayback()
+                    }
+                }
+                MediaPlayer.Event.Paused -> {
+                    binding.playPauseButton.setImageResource(R.drawable.ic_play)
+                    showControls()
+                    progressUpdateHandler.removeCallbacks(updateProgressRunnable)
+                    savePlaybackPosition()
+                }
+                MediaPlayer.Event.EncounteredError -> {
+                    // If this is an HLS stream still on the adaptive demuxer,
+                    // the failure may be the adaptive demuxer choking on this
+                    // provider's playlist. Flip to the legacy demuxer ONCE and
+                    // let softReconnect retry with it. If it's already on legacy
+                    // (or isn't HLS), just reconnect normally. This auto-recovers
+                    // providers that need the legacy demuxer without forcing it
+                    // on everyone (which broke providers like Tomek's).
+                    if (!isVOD && isHlsUrl && !forceLegacyHlsDemux) {
+                        forceLegacyHlsDemux = true
+                        Log.w("PlayerActivity",
+                            "HLS adaptive demux failed -> falling back to legacy demux")
+                    } else {
+                        Log.e("PlayerActivity", "VLC error -> reconnecting")
+                    }
+                    if (!isVOD) softReconnect()
+                }
+                MediaPlayer.Event.Vout -> {
+                    // Video output ready -- track width is now reliable. Read
+                    // it on a tiny delay because the very first Vout sometimes
+                    // fires before track dimensions are filled in.
+                    if (resolutionBadgeRepo.isEnabled()) {
+                        lifecycleScope.launch {
+                            delay(200)
+                            updateStreamResolutionLabel()
+                        }
+                    }
+                }
+                MediaPlayer.Event.EndReached -> {
+                    if (isVOD) {
+                        if (videoId != null) {
+                            val vid = videoId!!
+                            lifecycleScope.launch(Dispatchers.IO) { watchProgressRepository.removeProgress(vid) }
+                        }
+                        Toast.makeText(this, getString(R.string.player_stream_ended), Toast.LENGTH_SHORT).show()
+                        finish()
+                    } else {
+                        Log.w("PlayerActivity", "EndReached on live stream -> reconnect")
+                        liveEndReachedReconnect()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun formatTime(ms: Long): String {
+        val s = TimeUnit.MILLISECONDS.toSeconds(ms) % 60
+        val m = TimeUnit.MILLISECONDS.toMinutes(ms) % 60
+        val h = TimeUnit.MILLISECONDS.toHours(ms)
+        return if (h > 0) String.format("%d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
+    }
+
+    override fun onPause() {
+        super.onPause()
+
+        // PiP keeps the SurfaceView alive -- don't tear down or the user's
+        // floating window will be black. Skip teardown in PiP mode.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
+            return
+        }
+
+        // CRITICAL: tear down the player BEFORE the system starts destroying
+        // the SurfaceView. libVLC's AWindow listens for surfaceDestroyed and
+        // synchronously calls MediaPlayer.setVideoTrackEnabled(false), which
+        // acquires libVLC's internal mutex. On some devices, a VLC worker
+        // thread is holding that mutex while mid-JNI callback into Java,
+        // causing a classic AB-BA deadlock -- main thread blocked in
+        // vlc_mutex_lock, worker thread blocked, ANR.
+        //
+        // teardownPlayerAsync() now detaches the surface synchronously (with a
+        // bounded wait) BEFORE the system's surface-destruction cascade kicks
+        // off, then does the heavy stop()/release() on the shared serialized
+        // teardown thread. Detaching first means the surfaceDestroyed ->
+        // setVideoTrack path has nothing to grab the mutex for.
+        showChannelOverlay = false
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        progressUpdateHandler.removeCallbacks(updateProgressRunnable)
+        epgRefreshHandler.removeCallbacks(epgRefreshRunnable)
+        epgRefreshHandler.removeCallbacks(epgHideRunnable)
+        savePlaybackPosition()
+        teardownPlayerAsync()
+    }
+    /**
+     * Reads the current video track's width from libVLC and updates the
+     * compact resolution label shown in the EPG bar.
+     *
+     * Width thresholds use the standard marketing tiers. We deliberately
+     * use width rather than height because aspect ratios vary (cinematic
+     * 21:9 streams would otherwise be mis-bucketed by height).
+     *
+     * If currentVideoTrack returns null at first Vout, the next Vout event
+     * will retry, so no fallback path is needed.
+     */
+    private fun updateStreamResolutionLabel() {
+        val mp = mediaPlayer ?: return
+        val track = mp.currentVideoTrack ?: return
+        val width = track.width
+        if (width <= 0) return
+        val label = when {
+            width >= 7680 -> "8K"
+            width >= 3840 -> "4K"
+            width >= 1920 -> "FHD"
+            width >= 1280 -> "HD"
+            width >= 720  -> "SD"
+            else          -> ""
+        }
+        if (label != streamResolutionLabel) {
+            streamResolutionLabel = label
+        }
+    }
+
+
+    override fun onStop() {
+        super.onStop()
+        // Most of the teardown happened in onPause() to beat the system's
+        // SurfaceView destruction. This is now a safety net for two cases:
+        //   1. PiP -- onPause skipped teardown; we still need to clean up
+        //      when the PiP window is dismissed and onStop fires.
+        //   2. Unusual lifecycle paths where onPause didn't run.
+        //
+        // teardownPlayerAsync() is idempotent -- if onPause already nulled
+        // mediaPlayer/libVLC, this is a no-op.
+        showChannelOverlay = false
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        progressUpdateHandler.removeCallbacks(updateProgressRunnable)
+        epgRefreshHandler.removeCallbacks(epgRefreshRunnable)
+        epgRefreshHandler.removeCallbacks(epgHideRunnable)
+        savePlaybackPosition()
+        teardownPlayerAsync()
+        mainPlayerActive.value = false
+    }
+
+    /**
+     * Tears down the player robustly.
+     *
+     * Phase 1 (synchronous, main thread): stop new event callbacks, then
+     * detach the surface with a bounded wait. This severs libVLC's AWindow
+     * from the VLCVideoLayout BEFORE the system destroys the surface, so the
+     * surfaceDestroyed -> setVideoTrack -> vlc_mutex_lock path (the ANR) has
+     * nothing to do.
+     *
+     * Phase 2 (serialized executor): stop() + release() the player and lib on
+     * the process-wide single-thread VlcTeardownExecutor, shared with the mini
+     * player, so two native releases never overlap and never contend the mutex
+     * with each other.
+     *
+     * Idempotent: if mediaPlayer/libVLC are already null this is a no-op.
+     * Safe to call from onPause and onStop. The generation counter +
+     * playerActive guard (for the nativeGetStats SIGSEGV) are unchanged.
+     */
+    private fun teardownPlayerAsync() {
+        playerActive = false
+        playerGeneration++
+        val mpToRelease  = mediaPlayer
+        val vlcToRelease = libVLC
+        if (mpToRelease == null && vlcToRelease == null) return
+        mediaPlayer = null
+        libVLC = null
+
+        val tag = VlcTeardownExecutor.nextTag()
+        Log.d("Teardown", "#$tag begin (thread=${Thread.currentThread().name})")
+
+        // Phase 1 -- synchronous on the current (main) thread.
+        // Stop event callbacks first so no new JNI bounce starts, then detach
+        // the surface (bounded) before the system can destroy it.
+        try { mpToRelease?.setEventListener(null) } catch (_: Throwable) {}
+        detachSurfaceBounded(mpToRelease, tag)
+
+        // Phase 2 -- serialized native release on the shared single-thread executor.
+        VlcTeardownExecutor.submit("full stop+release", tag) {
+            try { mpToRelease?.stop()     } catch (_: Throwable) {}
+            try { mpToRelease?.release()  } catch (_: Throwable) {}
+            try { vlcToRelease?.release() } catch (_: Throwable) {}
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        hideControlsHandler.removeCallbacksAndMessages(null)
+        progressUpdateHandler.removeCallbacksAndMessages(null)
+        // Safety net: if the activity is destroyed while the player is still
+        // alive -- e.g. it was sitting in a (possibly window-less) PiP state
+        // where onStop never ran -- release it now so audio can't outlive the
+        // UI. Idempotent: teardownPlayerAsync() no-ops if onPause/onStop
+        // already tore the player down (mediaPlayer/libVLC null).
+        teardownPlayerAsync()
+        // NOTE: the shared VlcTeardownExecutor is process-wide and intentionally
+        // NOT shut down here -- another screen's MiniPlayer may still need it.
+    }
+}
+
+// =============================================================================
+// ChannelMenuOverlay -- translucent two-pane menu (category rail + channel list)
+// Designed so the live TV video stays visible through and around the menu.
+// Total menu width is 680dp; the rest of the screen is uncovered video.
+// =============================================================================
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+fun ChannelMenuOverlay(
+    visible: Boolean,
+    isTV: Boolean,
+    channels: List<Channel>,
+    playingIndex: Int,
+    channelFocusedIndex: Int,
+    categoryNames: List<String>,
+    categoryFocusedIndex: Int,
+    activeCategoryIndex: Int,
+    categoryName: String,
+    focusedPane: MenuPane,
+    globalFilter: String,
+    categoryQuery: String,
+    onCategoryQueryChange: (String) -> Unit,
+    favoriteChannelIds: Set<String>,
+    onChannelSelected: (Int) -> Unit,
+    onCategorySelected: (Int) -> Unit,
+    onFavoriteToggle: (Channel) -> Unit,
+    onDismiss: () -> Unit,
+    onReturnToCategories: () -> Unit,
+    onKeyboardOpenChange: (Boolean) -> Unit,
+    openKeyboard: Int,
+    onOpenKeyboardConsumed: () -> Unit,
+    closeKeyboard: Int,
+    onCloseKeyboardConsumed: () -> Unit
+) {
+    val channelListState = rememberLazyListState()
+    val categoryListState = rememberLazyListState()
+
+    // Channel list still respects the global filter passed in from intent
+    val filteredChannels = remember(channels, globalFilter) {
+        if (globalFilter.isBlank()) channels
+        else {
+            val prefixes = globalFilter.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+            if (prefixes.isEmpty()) channels
+            else channels.filter { ch -> prefixes.any { ch.name.lowercase().startsWith(it) } }
+        }
+    }
+    val filteredToOriginal = remember(channels, globalFilter) {
+        if (globalFilter.isBlank()) channels.indices.toList()
+        else {
+            val prefixes = globalFilter.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+            if (prefixes.isEmpty()) channels.indices.toList()
+            else channels.indices.filter { i -> prefixes.any { channels[i].name.lowercase().startsWith(it) } }
+        }
+    }
+
+    // Category filtering -- derived from hoisted query, word-prefix match
+    val filteredCategories = remember(categoryNames, categoryQuery) {
+        if (categoryQuery.isBlank()) categoryNames
+        else categoryNames.filter { matchesCategoryQuery(it, categoryQuery) }
+    }
+    val filteredCatToOriginal = remember(categoryNames, categoryQuery) {
+        if (categoryQuery.isBlank()) categoryNames.indices.toList()
+        else categoryNames.indices.filter { matchesCategoryQuery(categoryNames[it], categoryQuery) }
+    }
+
+    // Auto-scroll focused channel into view
+    // Auto-scroll focused channel into view. The try/catch protects against
+    // a Compose-internal race: the LazyListState can be out of sync with
+    // our computed filteredChannels.size mid-recomposition, throwing
+    // IllegalArgumentException from scrollToItem. The next composition
+    // re-triggers this effect with consistent state, so swallowing it
+    // is safe. This is the IllegalArgumentException crash reported by
+    // Play Console for ChannelMenuOverlay's coroutine.
+    LaunchedEffect(channelFocusedIndex, visible, filteredChannels.size) {
+        if (visible && filteredChannels.isNotEmpty()) {
+            val fi = filteredToOriginal.indexOf(channelFocusedIndex)
+            val target = if (fi >= 0) fi else channelFocusedIndex.coerceIn(0, filteredChannels.size - 1)
+            try {
+                channelListState.scrollToItem(target)
+            } catch (e: IllegalArgumentException) {
+                // list state out of sync; next recomposition will retry
+            }
+        }
+    }
+
+    // Auto-scroll focused category into view (categoryFocusedIndex is in *filtered* space, -1 = search)
+    LaunchedEffect(categoryFocusedIndex, visible, filteredCategories.size) {
+        if (visible && categoryFocusedIndex >= 0 && filteredCategories.isNotEmpty()) {
+            try {
+                categoryListState.scrollToItem(categoryFocusedIndex.coerceIn(0, filteredCategories.size - 1))
+            } catch (e: IllegalArgumentException) {
+                // same protection as above
+            }
+        }
+    }
+
+    // TV keyboard for category search -- rendered as a sibling overlay so it can
+    // fillMaxSize properly instead of being squished into the 220.dp rail Column.
+    var showTvKeyboard by remember { mutableStateOf(false) }
+    LaunchedEffect(openKeyboard) {
+        if (openKeyboard > 0) { showTvKeyboard = true; onOpenKeyboardConsumed() }
+    }
+    LaunchedEffect(closeKeyboard) {
+        if (closeKeyboard > 0) { showTvKeyboard = false; onCloseKeyboardConsumed() }
+    }
+    LaunchedEffect(showTvKeyboard) { onKeyboardOpenChange(showTvKeyboard) }
+    // Close keyboard if the whole menu closes
+    LaunchedEffect(visible) { if (!visible) showTvKeyboard = false }
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(180)) + slideInHorizontally(tween(220)) { -it },
+        exit = fadeOut(tween(160)) + slideOutHorizontally(tween(200)) { -it }
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Very faint global dim -- keeps the underlying video alive
+            Box(modifier = Modifier.fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.18f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { onDismiss() }
+            )
+
+            // Two-pane menu sits flush against the left edge
+            Row(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .width(680.dp)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { /* swallow taps inside the menu */ }
+            ) {
+                // ___ LEFT RAIL: CATEGORIES (now with search at top) ___________
+                CategoryRail(
+                    isTV = isTV,
+                    filteredCategories = filteredCategories,
+                    filteredCatToOriginal = filteredCatToOriginal,
+                    activeCategoryIndex = activeCategoryIndex,
+                    focusedIndex = categoryFocusedIndex,
+                    isPaneFocused = focusedPane == MenuPane.CATEGORIES,
+                    listState = categoryListState,
+                    categoryQuery = categoryQuery,
+                    onCategoryQueryChange = onCategoryQueryChange,
+                    onCategorySelected = onCategorySelected,
+                    onOpenSearchKeyboard = { showTvKeyboard = true },
+                    showTvKeyboard = showTvKeyboard,
+                    onCloseTvKeyboard = { showTvKeyboard = false }
+                )
+
+                // ___ RIGHT PANE: CHANNEL LIST _________________________________
+                ChannelListPane(
+                    isTV = isTV,
+                    channels = channels,
+                    filteredChannels = filteredChannels,
+                    filteredToOriginal = filteredToOriginal,
+                    playingIndex = playingIndex,
+                    focusedIndex = channelFocusedIndex,
+                    isPaneFocused = focusedPane == MenuPane.CHANNELS,
+                    categoryName = categoryName,
+                    favoriteChannelIds = favoriteChannelIds,
+                    globalFilter = globalFilter,
+                    listState = channelListState,
+                    onChannelSelected = onChannelSelected,
+                    onFavoriteToggle = onFavoriteToggle,
+                    onDismiss = onDismiss
+                )
+            }
+
+            // Bottom hint bar -- thin strip, full width, low alpha
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.BottomCenter)
+                    .height(40.dp)
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 24.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                androidx.compose.material3.Text(
+                    text = if (isTV) stringResource(R.string.player_hint_tv)
+                    else stringResource(R.string.player_hint_phone),
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 11.sp,
+                    maxLines = 1
+                )
+            }
+
+            // ___ PHONE: Floating back button (top-left corner of screen) _____
+            // Bold, solid, hard to miss. Returns to the category browser.
+            if (!isTV) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(start = 12.dp, top = 12.dp)
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFF1E3A5F).copy(alpha = 0.95f))
+                        .border(
+                            width = 1.dp,
+                            color = Color(0xFF378ADD).copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .clickable { onReturnToCategories() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    androidx.compose.material3.Text(
+                        "<-",
+                        color = Color.White,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ___ CategoryRail ____________________________________________________________
+// focusedIndex semantics:
+//   -1 = search pill focused
+//    0..filteredCategories.size-1 = category in filtered list focused
+@Composable
+private fun CategoryRail(
+    isTV: Boolean,
+    filteredCategories: List<String>,
+    filteredCatToOriginal: List<Int>,
+    activeCategoryIndex: Int,
+    focusedIndex: Int,
+    isPaneFocused: Boolean,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    categoryQuery: String,
+    onCategoryQueryChange: (String) -> Unit,
+    onCategorySelected: (Int) -> Unit,
+    onOpenSearchKeyboard: () -> Unit,
+    showTvKeyboard: Boolean = false,
+    onCloseTvKeyboard: () -> Unit = {}
+) {
+    val searchFocused = isPaneFocused && focusedIndex == -1
+
+    Box(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(280.dp)
+            .background(Color(0xFF0A0F1C).copy(alpha = 0.55f))
+            .border(
+                width = 0.5.dp,
+                color = Color.White.copy(alpha = 0.08f)
+            )
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Header
+            androidx.compose.material3.Text(
+                text = stringResource(R.string.player_overlay_categories).uppercase(),
+                color = Color.White.copy(alpha = 0.55f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 2.sp,
+                modifier = Modifier.padding(
+                    start = 24.dp,
+                    top = if (isTV) 24.dp else 68.dp,  // leave room for floating back button on phones
+                    bottom = 8.dp
+                )
+            )
+
+            // ___ Search pill _____________________________________________
+            if (isTV) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (searchFocused) Color(0xFF378ADD).copy(alpha = 0.40f)
+                            else Color.Black.copy(alpha = 0.28f)
+                        )
+                        .border(
+                            width = if (searchFocused) 2.5.dp else 0.5.dp,
+                            color = if (searchFocused) Color(0xFF378ADD)
+                            else Color.White.copy(alpha = 0.18f),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .clickable { onOpenSearchKeyboard() }
+                        .padding(horizontal = 14.dp, vertical = 14.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Text(
+                            "\uD83D\uDD0D",
+                            fontSize = if (searchFocused) 14.sp else 12.sp
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        androidx.compose.material3.Text(
+                            text = if (categoryQuery.isBlank()) stringResource(R.string.player_filter_categories) else categoryQuery,
+                            color = if (searchFocused) Color.White
+                            else if (categoryQuery.isBlank()) Color.White.copy(alpha = 0.5f)
+                            else Color.White,
+                            fontSize = if (searchFocused) 13.sp else 12.sp,
+                            fontWeight = if (searchFocused) FontWeight.Bold else FontWeight.Normal,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (categoryQuery.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Color.White.copy(alpha = 0.12f))
+                                    .clickable { onCategoryQueryChange("") },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                androidx.compose.material3.Text("\u2715", color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
+                            }
+                        }
+                    }
+                }
+            } else {
+                val keyboardController = LocalSoftwareKeyboardController.current
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black.copy(alpha = 0.25f))
+                        .border(0.5.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(10.dp))
+                ) {
+                    TextField(
+                        value = categoryQuery,
+                        onValueChange = onCategoryQueryChange,
+                        placeholder = {
+                            androidx.compose.material3.Text(
+                                stringResource(R.string.player_filter_categories),
+                                color = Color.White.copy(alpha = 0.5f),
+                                fontSize = 12.sp
+                            )
+                        },
+                        singleLine = true,
+                        textStyle = TextStyle(color = Color.White, fontSize = 12.sp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { keyboardController?.hide() }),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            unfocusedIndicatorColor = Color.Transparent,
+                            cursorColor = Color(0xFF378ADD)
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = if (categoryQuery.isNotEmpty()) {{
+                            Box(
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .clip(RoundedCornerShape(11.dp))
+                                    .background(Color.White.copy(alpha = 0.15f))
+                                    .clickable { onCategoryQueryChange("") },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                androidx.compose.material3.Text("\u2715", color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
+                            }
+                        }} else null
+                    )
+                }
+            }
+
+            // Inline TV keyboard renders right below the filter pill, replacing
+            // the category list while it's open. Compact and fits the rail width.
+            if (isTV && showTvKeyboard) {
+                InlineTvKeyboard(
+                    currentQuery = categoryQuery,
+                    onQueryChange = onCategoryQueryChange,
+                    onDone = onCloseTvKeyboard
+                )
+            } else {
+                // Empty state if filter returns nothing
+                if (filteredCategories.isEmpty() && categoryQuery.isNotBlank()) {
+                    Box(
+                        Modifier.fillMaxWidth().padding(vertical = 20.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        androidx.compose.material3.Text(
+                            stringResource(R.string.category_no_match),
+                            color = Color.White.copy(alpha = 0.5f),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(top = 4.dp, bottom = 56.dp)
+                ) {
+                    itemsIndexed(filteredCategories, key = { i, n -> "${i}_$n" }) { filteredIdx, name ->
+                        val originalIdx = filteredCatToOriginal.getOrElse(filteredIdx) { filteredIdx }
+                        val isActive = originalIdx == activeCategoryIndex
+                        val isFocused = isPaneFocused && filteredIdx == focusedIndex
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    when {
+                                        isFocused -> Color(0xFF378ADD).copy(alpha = 0.22f)
+                                        isActive  -> Color(0xFF378ADD).copy(alpha = 0.10f)
+                                        else      -> Color.Transparent
+                                    }
+                                )
+                                .border(
+                                    width = if (isFocused) 1.5.dp else 0.dp,
+                                    color = if (isFocused) Color(0xFF378ADD) else Color.Transparent,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable { onCategorySelected(originalIdx) }
+                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isFocused || isActive) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(3.dp)
+                                            .height(22.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(Color(0xFF378ADD))
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                }
+                                androidx.compose.material3.Text(
+                                    text = name,
+                                    color = when {
+                                        isFocused -> Color.White
+                                        isActive  -> Color.White.copy(alpha = 0.9f)
+                                        else      -> Color.White.copy(alpha = 0.7f)
+                                    },
+                                    fontSize = 12.sp,
+                                    fontWeight = if (isFocused || isActive) FontWeight.SemiBold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ___ ChannelListPane _________________________________________________________
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun ChannelListPane(
+    isTV: Boolean,
+    channels: List<Channel>,
+    filteredChannels: List<Channel>,
+    filteredToOriginal: List<Int>,
+    playingIndex: Int,
+    focusedIndex: Int,
+    isPaneFocused: Boolean,
+    categoryName: String,
+    favoriteChannelIds: Set<String>,
+    globalFilter: String,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    onChannelSelected: (Int) -> Unit,
+    onFavoriteToggle: (Channel) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(400.dp)
+            .background(Color(0xFF0E1422).copy(alpha = 0.50f))
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Phone-only close button at the top right of the channel pane
+            if (!isTV) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 0.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.White.copy(alpha = 0.06f))
+                            .clickable { onDismiss() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        androidx.compose.material3.Text(
+                            "\u2715",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            }
+
+            // Header
+            Column(modifier = Modifier.padding(
+                start = 24.dp,
+                top = if (isTV) 22.dp else 8.dp,
+                end = 20.dp,
+                bottom = 12.dp
+            )) {
+                androidx.compose.material3.Text(
+                    text = if (categoryName.isNotBlank()) categoryName else stringResource(R.string.player_channels_header),
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val activeFilterLabel = stringResource(R.string.player_filter_active)
+                val countText = remember(channels.size, globalFilter) {
+                    buildString {
+                        append("${channels.size} ")
+                        append(if (channels.size == 1) "channel" else "channels")
+                        if (globalFilter.isNotBlank()) append("  \u00B7  $activeFilterLabel")
+                    }
+                }
+                androidx.compose.material3.Text(
+                    text = countText,
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(top = 3.dp)
+                )
+            }
+
+            // Empty state if filter excludes everything
+            if (filteredChannels.isEmpty() && globalFilter.isNotBlank()) {
+                Box(
+                    Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    androidx.compose.material3.Text(
+                        stringResource(R.string.player_no_channels_match),
+                        color = Color.White.copy(alpha = 0.5f),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+
+            // Channel rows
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 56.dp)
+            ) {
+                itemsIndexed(filteredChannels, key = { idx, ch -> ch.id.ifBlank { "ch_$idx" } + "_" + idx }) { filteredIdx, channel ->
+                    val originalIdx = filteredToOriginal.getOrElse(filteredIdx) { filteredIdx }
+                    val isFocused = isPaneFocused && originalIdx == focusedIndex
+                    val isPlaying = originalIdx == playingIndex
+                    val isFav = channel.id in favoriteChannelIds
+
+                    ChannelRow(
+                        channel = channel,
+                        isFocused = isFocused,
+                        isPlaying = isPlaying,
+                        isFav = isFav,
+                        onSelect = { onChannelSelected(originalIdx) },
+                        onFavoriteToggle = { onFavoriteToggle(channel) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ___ ChannelRow -- only the focused row gets a near-opaque background ________
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun ChannelRow(
+    channel: Channel,
+    isFocused: Boolean,
+    isPlaying: Boolean,
+    isFav: Boolean,
+    onSelect: () -> Unit,
+    onFavoriteToggle: () -> Unit
+) {
+    // EPG now-event for the row's secondary line
+    var epgNow by remember(channel.id) { mutableStateOf<StalkerEpgEvent?>(null) }
+    LaunchedEffect(channel.id) {
+        epgNow = withContext(Dispatchers.Default) { EpgRepository.getBestEpg(channel).first }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 3.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                when {
+                    isFocused -> Color(0xFF0A1A2E).copy(alpha = 0.92f)
+                    isPlaying -> Color(0xFF378ADD).copy(alpha = 0.08f)
+                    else -> Color.Transparent
+                }
+            )
+            .border(
+                width = if (isFocused) 2.dp else 0.dp,
+                color = if (isFocused) Color(0xFF378ADD) else Color.Transparent,
+                shape = RoundedCornerShape(10.dp)
+            )
+            .combinedClickable(
+                onClick = onSelect,
+                onLongClick = onFavoriteToggle
+            )
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Accent bar on focused row
+            if (isFocused) {
+                Box(
+                    modifier = Modifier
+                        .width(3.dp)
+                        .height(34.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(Color(0xFF378ADD))
+                )
+                Spacer(Modifier.width(10.dp))
+            }
+
+            // Logo / initial
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFF378ADD).copy(alpha = if (isFocused) 0.30f else 0.25f)),
+                contentAlignment = Alignment.Center
+            ) {
+                val logoUrl = channel.logo ?: EpgRepository.iconFor(channel)
+                if (!logoUrl.isNullOrBlank()) {
+                    AsyncImage(
+                        model = logoUrl,
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))
+                    )
+                } else {
+                    androidx.compose.material3.Text(
+                        channel.name.take(2).uppercase(),
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            // Name + EPG line
+            Column(modifier = Modifier.weight(1f)) {
+                androidx.compose.material3.Text(
+                    text = channel.name,
+                    color = when {
+                        isFocused -> Color.White
+                        isPlaying -> Color.White.copy(alpha = 0.9f)
+                        else -> Color.White.copy(alpha = 0.85f)
+                    },
+                    fontSize = 13.sp,
+                    fontWeight = if (isFocused || isPlaying) FontWeight.SemiBold else FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (epgNow != null) {
+                    androidx.compose.material3.Text(
+                        text = "\u25B6 ${epgNow!!.title}",
+                        color = Color(0xFF93C5FD).copy(alpha = if (isFocused) 0.9f else 0.6f),
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+
+            // LIVE pip on the focused/playing row
+            if ((isFocused || isPlaying) && epgNow != null) {
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(0xFFE24B4A).copy(alpha = 0.25f))
+                        .padding(horizontal = 7.dp, vertical = 3.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(5.dp)
+                                .clip(RoundedCornerShape(2.5.dp))
+                                .background(Color(0xFFE24B4A))
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        androidx.compose.material3.Text(
+                            stringResource(R.string.home_live_badge),
+                            color = Color(0xFFFCA5A5),
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.width(8.dp))
+
+            // Favourite star
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(
+                        if (isFav) Color(0xFFFBBF24).copy(alpha = 0.18f)
+                        else Color.White.copy(alpha = 0.04f)
+                    )
+                    .clickable { onFavoriteToggle() },
+                contentAlignment = Alignment.Center
+            ) {
+                androidx.compose.material3.Text(
+                    if (isFav) stringResource(R.string.star_icon) else stringResource(R.string.star_outline_icon),
+                    color = if (isFav) Color(0xFFFBBF24) else Color.White.copy(alpha = 0.35f),
+                    fontSize = 13.sp
+                )
+            }
+        }
+    }
+}
+
+
+// =============================================================================
+// InlineTvKeyboard -- compact D-pad keyboard that fits inside the category rail.
+// Renders inline below the filter pill, taking only the rail's 280dp width.
+// =============================================================================
+@OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
+@Composable
+private fun InlineTvKeyboard(
+    currentQuery: String,
+    onQueryChange: (String) -> Unit,
+    onDone: () -> Unit
+) {
+    val rows = listOf(
+        listOf("1","2","3","4","5","6","7","8","9","0"),
+        listOf("q","w","e","r","t","y","u","i","o","p"),
+        listOf("a","s","d","f","g","h","j","k","l"),
+        listOf("z","x","c","v","b","n","m")
+    )
+
+    // Focus the first key when keyboard appears so D-pad has somewhere to go.
+    val firstKeyFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        delay(80)
+        try { firstKeyFocus.requestFocus() } catch (_: Exception) {}
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 6.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFF06080E).copy(alpha = 0.92f))
+            .border(0.5.dp, Color(0xFF378ADD).copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+            .padding(6.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        rows.forEachIndexed { rowIdx, row ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                row.forEachIndexed { keyIdx, key ->
+                    val isFirstKey = rowIdx == 0 && keyIdx == 0
+                    KeyboardKey(
+                        label = key.uppercase(),
+                        modifier = if (isFirstKey)
+                            Modifier.weight(1f).focusRequester(firstKeyFocus)
+                        else Modifier.weight(1f),
+                        onClick = { onQueryChange(currentQuery + key) }
+                    )
+                }
+            }
+        }
+
+        // Bottom row: space, backspace, done
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            // Space -- wider
+            KeyboardKey(
+                label = stringResource(R.string.player_key_space),
+                modifier = Modifier.weight(3f),
+                labelSize = 9.sp,
+                onClick = { onQueryChange("$currentQuery ") }
+            )
+            // Backspace
+            KeyboardKey(
+                label = "\u232B",
+                modifier = Modifier.weight(1.4f),
+                tint = Color(0xFFE24B4A),
+                onClick = { if (currentQuery.isNotEmpty()) onQueryChange(currentQuery.dropLast(1)) }
+            )
+            // Done -- closes keyboard
+            KeyboardKey(
+                label = stringResource(R.string.player_key_done),
+                modifier = Modifier.weight(1.6f),
+                labelSize = 9.sp,
+                tint = Color(0xFF378ADD),
+                emphasised = true,
+                onClick = onDone
+            )
+        }
+    }
+}
+
+@OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
+@Composable
+private fun KeyboardKey(
+    label: String,
+    modifier: Modifier = Modifier,
+    labelSize: androidx.compose.ui.unit.TextUnit = 12.sp,
+    tint: Color? = null,
+    emphasised: Boolean = false,
+    onClick: () -> Unit
+) {
+    androidx.tv.material3.Surface(
+        onClick = onClick,
+        modifier = modifier.height(28.dp),
+        shape = androidx.tv.material3.ClickableSurfaceDefaults.shape(RoundedCornerShape(5.dp)),
+        colors = androidx.tv.material3.ClickableSurfaceDefaults.colors(
+            containerColor = when {
+                emphasised && tint != null -> tint.copy(alpha = 0.25f)
+                tint != null -> tint.copy(alpha = 0.18f)
+                else -> Color.White.copy(alpha = 0.08f)
+            },
+            focusedContainerColor = tint ?: Color(0xFF378ADD)
+        ),
+        border = androidx.tv.material3.ClickableSurfaceDefaults.border(
+            border = androidx.tv.material3.Border(
+                androidx.compose.foundation.BorderStroke(0.dp, Color.Transparent)
+            ),
+            focusedBorder = androidx.tv.material3.Border(
+                androidx.compose.foundation.BorderStroke(1.5.dp, Color(0xFF93C5FD)),
+                shape = RoundedCornerShape(5.dp)
+            )
+        ),
+        scale = androidx.tv.material3.ClickableSurfaceDefaults.scale(focusedScale = 1.10f)
+    ) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            androidx.compose.material3.Text(
+                text = label,
+                color = Color.White.copy(alpha = if (emphasised) 1f else 0.9f),
+                fontSize = labelSize,
+                fontWeight = if (emphasised) FontWeight.SemiBold else FontWeight.Medium
+            )
+        }
+    }
+}
+
+// =============================================================================
+// EPG Bottom Bar -- auto-hiding info strip shown when menu is closed
+// =============================================================================
+@Composable
+fun EpgBottomBar(
+    channelName: String,
+    nowEvent: StalkerEpgEvent?,
+    nextEvent: StalkerEpgEvent?,
+    resolutionLabel: String = ""
+) {
+    val formatter = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()) }
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .background(androidx.compose.ui.graphics.Brush.verticalGradient(
+                listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+            ))
+            .padding(horizontal = 40.dp, vertical = 20.dp)
+    ) {
+        Column {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Box(modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFF378ADD))
+                    .padding(horizontal = 10.dp, vertical = 4.dp)) {
+                    androidx.compose.material3.Text(text = channelName, color = Color.White,
+                        fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                if (resolutionLabel.isNotBlank()) {
+                    Spacer(Modifier.width(8.dp))
+                    Box(modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(0xFFFBBF24).copy(alpha = 0.18f))
+                        .border(1.dp, Color(0xFFFBBF24).copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)) {
+                        androidx.compose.material3.Text(
+                            text = resolutionLabel,
+                            color = Color(0xFFFBBF24),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp
+                        )
+                    }
+                }
+                Spacer(Modifier.width(16.dp))
+                if (nowEvent != null) {
+                    androidx.compose.material3.Text(text = nowEvent.title, color = Color.White,
+                        fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    Spacer(Modifier.width(16.dp))
+                    androidx.compose.material3.Text(
+                        text = "${formatter.format(java.util.Date(nowEvent.start * 1000))} \u2013 ${formatter.format(java.util.Date(nowEvent.end * 1000))}",
+                        color = Color(0xFF378ADD), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                } else {
+                    androidx.compose.material3.Text(text = stringResource(R.string.player_no_epg),
+                        color = Color(0xFF808080), fontSize = 14.sp, modifier = Modifier.weight(1f))
+                }
+            }
+            if (nowEvent != null) {
+                Spacer(Modifier.height(8.dp))
+                val nowSec = System.currentTimeMillis() / 1000
+                val progress = ((nowSec - nowEvent.start).toFloat() / (nowEvent.end - nowEvent.start).toFloat()).coerceIn(0f, 1f)
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)),
+                    color = Color(0xFF378ADD), trackColor = Color.White.copy(alpha = 0.2f)
+                )
+                if (nowEvent.description.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    androidx.compose.material3.Text(text = nowEvent.description, color = Color(0xFFAAAAAA),
+                        fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, lineHeight = 17.sp)
+                }
+                if (nextEvent != null) {
+                    Spacer(Modifier.height(6.dp))
+                    androidx.compose.material3.Text(
+                        text = stringResource(R.string.player_epg_next, nextEvent.title) + "  ${formatter.format(java.util.Date(nextEvent.start * 1000))}",
+                        color = Color(0xFF808080), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
