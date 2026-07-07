@@ -42,6 +42,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -1025,10 +1026,11 @@ fun ContentBrowseScreen(
                                 .weight(0.35f)
                         ) {
                             SearchBar(
-                                searchQuery          = searchQuery,
+                                searchQuery = searchQuery,
                                 onSearchQueryChanged = { searchQuery = it; onSearchQueryChanged?.invoke(it) },
-                                onFocusChanged       = { searchFocused = it },
-                                accentColor          = categoryAccent
+                                onFocusChanged = { searchFocused = it },
+                                accentColor = categoryAccent,
+                                downFocusRequester = listFocusRequester
                             )
                             Spacer(modifier = Modifier.height(12.dp))
                             ContentList(
@@ -1155,10 +1157,11 @@ fun ContentBrowseScreen(
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun SearchBar(
-    searchQuery:          String,
+    searchQuery: String,
     onSearchQueryChanged: (String) -> Unit,
-    onFocusChanged:       (Boolean) -> Unit,
-    accentColor:          Color = Color(0xFF3B82F6)
+    onFocusChanged: (Boolean) -> Unit,
+    accentColor: Color = Color(0xFF3B82F6),
+    downFocusRequester: FocusRequester? = null
 ) {
     var searchFocused by remember { mutableStateOf(false) }
 
@@ -1179,8 +1182,15 @@ private fun SearchBar(
             placeholder   = {
                 Text(stringResource(id = R.string.search_label), color = Color.White.copy(alpha = 0.4f))
             },
-            modifier   = Modifier
+            modifier = Modifier
                 .fillMaxWidth()
+                // ANR fix: DOWN from search used to trigger Compose's
+                // beyond-bounds focus search, which synchronously composes
+                // and measures grid items beyond the viewport hunting for a
+                // landing target -- two Play Console ANRs on weak boxes,
+                // both entering via the IME path. Pinning DOWN to the list
+                // container skips the hunt entirely.
+                .focusProperties { downFocusRequester?.let { fr -> down = fr } }
                 .onFocusChanged {
                     searchFocused = it.isFocused
                     onFocusChanged(it.isFocused)
@@ -1423,8 +1433,12 @@ private fun ContentList(
                             }
                     }
                     LazyColumn(
-                        state                 = listState,
-                        modifier              = Modifier.fillMaxSize().focusRequester(focusRequester),
+                        state = listState,
+                        // focusGroup: bounds the 2D focus search at the
+                        // container's edges instead of letting it enumerate
+                        // beyond-bounds candidates (the ANR path).
+                        modifier = Modifier.fillMaxSize().focusRequester(focusRequester).focusGroup(),
+
                         contentPadding        = PaddingValues(top = 12.dp, bottom = 32.dp),
                         verticalArrangement   = Arrangement.spacedBy(4.dp)
                     ) {
