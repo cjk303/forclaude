@@ -1,0 +1,537 @@
+package com.kam.magplayer
+
+import android.net.Uri
+import android.util.Log
+import android.view.ViewTreeObserver
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+private data class MiniPlayerState(val vlc: LibVLC, val mp: MediaPlayer)
+
+private const val TAG = "MiniPlayer"
+private const val MAX_RECONNECT_ATTEMPTS = 5
+private const val DEBOUNCE_MS = 550L
+
+// -- Global state --------------------------------------------------------------
+
+// FIX: Mini player now defaults to unmuted (false) so it plays audio by default.
+val globalMuted = mutableStateOf(false)
+val mainPlayerActive = mutableStateOf(false)
+
+@Composable
+fun MiniPlayer(streamUrl: String?, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val scope   = rememberCoroutineScope()
+
+    val vlcVideoLayout  = remember { VLCVideoLayout(context) }
+    val playMutex       = remember { Mutex() }
+    val hasError        = remember { AtomicBoolean(false) }
+    val reconnectCount  = remember { AtomicInteger(0) }
+    val reconnectJobRef = remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val surfaceReady    = remember { mutableStateOf(false) }
+
+    // Use-after-free guard. The mini player auto-starts on every channel
+    // switch and category selection, so its teardown path is exercised far
+    // more often than the full player's. onDispose releases the native
+    // MediaPlayer/LibVLC on a daemon thread, but the watchdog coroutine
+    // captured the MiniPlayerState by value and would happily keep calling
+    // into state.mp (isPlaying, stop, play) on freed native memory --
+    // exactly the SIGSEGV/SIGABRT class we removed from PlayerActivity.
+    //
+    // This flag is set BEFORE release begins. Every native-touch site checks
+    // it INSIDE playMutex, and the release itself runs under the same mutex,
+    // so a native call and the release can never overlap.
+    val released = remember { AtomicBoolean(false) }
+
+    // Resolution badge. Same source + bucketing as PlayerActivity
+    // (currentVideoTrack.width), gated on the shared "Show resolution"
+    // toggle. The repo read is cheap (SharedPreferences) so creating it
+    // per-composition is fine.
+    val resolutionBadgeRepo = remember { ResolutionBadgeRepository(context) }
+    var resolutionLabel by remember { mutableStateOf("") }
+
+    var isBuffering  by remember { mutableStateOf(false) }
+    var hasStreamErr by remember { mutableStateOf(false) }
+    var isMuted      by globalMuted
+
+    var playerState by remember { mutableStateOf<MiniPlayerState?>(null) }
+
+    // Bumped on ON_START so the play effect re-runs after an ON_STOP stop.
+    // LaunchedEffect does NOT restart on recomposition alone -- without a
+    // changed key, a stopped preview would stay black on return (previously
+    // it was accidentally revived by the reconnect watchdog, which also
+    // revived it in the BACKGROUND -- see the observer below).
+    val restartTick = remember { mutableStateOf(0) }
+
+    // -- Stop native playback when the host/app goes to background -------------
+    // The mini player previously only stopped on onDispose. But on many TV
+    // launchers the host screen stays in composition while the Activity is
+    // merely STOPPED (not destroyed), so onDispose never fires and the preview
+    // keeps decoding audio in the background -- the "sound keeps playing after
+    // I left the app" report. Stopping on ON_STOP closes that gap. We do NOT
+    // force a resume here: the existing play effect (keyed on streamUrl /
+    // playerState / surfaceReady) re-plays naturally when the host returns to
+    // the foreground and recomposes, so an explicit ON_START resume would only
+    // risk racing that effect. The stop goes through playMutex + the released
+    // guard like every other native touch, so it can't race teardown.
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, playerState) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    // Kill the watchdog FIRST. It only checks hasError +
+                    // isPlaying, so it cannot distinguish this deliberate
+                    // stop from a stream failure -- left running, it would
+                    // call playUrl() ~8s after we stop and resurrect audio
+                    // in the background (the exact bug ON_STOP was added
+                    // to fix).
+                    reconnectJobRef.value?.cancel()
+                    reconnectJobRef.value = null
+                    val mp = playerState?.mp
+                    if (mp == null || released.get()) return@LifecycleEventObserver
+                    scope.launch(Dispatchers.IO) {
+                        playMutex.withLock {
+                            if (released.get()) return@withLock
+                            try { mp.stop() } catch (_: Exception) {}
+                        }
+                    }
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    // Deliberate, foreground-only resume: re-key the play
+                    // effect. Replaces the accidental watchdog revive.
+                    restartTick.value++
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // -- Init VLC on main thread -----------------------------------------------
+    LaunchedEffect(Unit) {
+        val (vlc, mp) = withContext(Dispatchers.IO) {
+            val opts = arrayListOf(
+                "--http-reconnect",
+                "--no-sub-autodetect-file",
+                "--no-media-library",
+                "--avcodec-hw=any",
+                "--audio-resampler=soxr",
+                "--verbose=-1",
+                "--aout=android_audiotrack",
+                "--network-caching=2000",
+                "--live-caching=2000",
+                "--file-caching=1000",
+                "--clock-jitter=0",
+                "--clock-synchro=0"
+            )
+            val vlc = LibVLC(context, opts)
+            val mp  = MediaPlayer(vlc)
+            vlc to mp
+        }
+        playerState = MiniPlayerState(vlc, mp)
+        Log.d(TAG, "LibVLC initialised on ${Thread.currentThread().name}")
+    }
+
+    // -- Mute toggle -----------------------------------------------------------
+    LaunchedEffect(isMuted, playerState) {
+        val mp = playerState?.mp ?: return@LaunchedEffect
+        if (released.get()) return@LaunchedEffect
+        // Update volume immediately if already playing. Guarded by the mutex
+        // so it can't race the release thread.
+        withContext(Dispatchers.IO) {
+            playMutex.withLock {
+                if (released.get()) return@withLock
+                try { if (mp.isPlaying) mp.volume = if (isMuted) 0 else 100 } catch (_: Exception) {}
+            }
+        }
+    }
+
+    // -- Play / stop based on streamUrl ----------------------------------------
+    LaunchedEffect(streamUrl, playerState, surfaceReady.value, restartTick.value) {
+        val state = playerState ?: return@LaunchedEffect
+        if (released.get()) return@LaunchedEffect
+
+        reconnectJobRef.value?.cancel()
+        reconnectJobRef.value = null
+        hasError.set(false)
+        reconnectCount.set(0)
+        hasStreamErr = false
+        try { state.mp.setEventListener(null) } catch (_: Exception) {}
+
+        if (streamUrl.isNullOrBlank()) {
+            isBuffering = false
+            resolutionLabel = ""
+            withContext(Dispatchers.IO) {
+                playMutex.withLock {
+                    if (released.get()) return@withLock
+                    try { state.mp.stop() } catch (_: Exception) {}
+                }
+            }
+            return@LaunchedEffect
+        }
+
+        if (!surfaceReady.value) {
+            Log.d(TAG, "Surface not ready -- deferring: $streamUrl")
+            return@LaunchedEffect
+        }
+
+        isBuffering = true
+        delay(DEBOUNCE_MS)
+        if (!isActive || released.get()) return@LaunchedEffect
+
+        val urlSnapshot = streamUrl
+        hasStreamErr    = false
+        // New stream -> clear the old resolution badge until this stream's
+        // Vout event reports its track width.
+        resolutionLabel = ""
+
+        state.mp.setEventListener { event ->
+            when (event.type) {
+                MediaPlayer.Event.Playing -> {
+                    try { state.mp.volume = if (isMuted) 0 else 100 } catch (_: Exception) {}
+                    isBuffering = false; hasStreamErr = false
+                    hasError.set(false); reconnectCount.set(0)
+                }
+                MediaPlayer.Event.Buffering -> { isBuffering = event.buffering < 100f }
+                MediaPlayer.Event.Vout -> {
+                    // Video output ready -- read the track width and bucket it
+                    // into the same tiers as PlayerActivity so the two surfaces
+                    // agree. Gated on the shared toggle. The native read goes
+                    // through playMutex + released guard because the mini
+                    // player's whole safety model requires every native touch
+                    // to be serialized against teardown. A small delay lets the
+                    // first Vout settle before currentVideoTrack is populated.
+                    if (resolutionBadgeRepo.isEnabled()) {
+                        scope.launch {
+                            delay(200)
+                            if (released.get()) return@launch
+                            val w = withContext(Dispatchers.IO) {
+                                playMutex.withLock {
+                                    if (released.get()) return@withLock 0
+                                    try { state.mp.currentVideoTrack?.width ?: 0 } catch (_: Exception) { 0 }
+                                }
+                            }
+                            val label = when {
+                                w >= 7680 -> "8K"
+                                w >= 3840 -> "4K"
+                                w >= 1920 -> "FHD"
+                                w >= 1280 -> "HD"
+                                w >= 720  -> "SD"
+                                else      -> ""
+                            }
+                            if (label != resolutionLabel) resolutionLabel = label
+                        }
+                    }
+                }
+                MediaPlayer.Event.EncounteredError, MediaPlayer.Event.EndReached -> {
+                    hasError.set(true); hasStreamErr = true; isBuffering = false
+                    Log.w(TAG, "Stream error/ended for $urlSnapshot")
+                }
+                else -> {}
+            }
+        }
+
+        // Attach + play under ONE mutex hold so a previous stream's stop()
+        // -- which can sit in input_Close/vlc_join for seconds while holding
+        // libVLC's internal mutex -- can NEVER overlap this attachViews.
+        // That overlap (stop() on a worker vs attachViews on the main thread,
+        // both wanting the same libVLC mutex) is the [libvlc.so]
+        // vlc_mutex_lock ANR seen while scrolling the channel list. withLock
+        // SUSPENDS the main coroutine rather than blocking the main thread, so
+        // libVLC's AWindow handler keeps pumping and the in-flight stop() can
+        // finish and release the lock before we attach.
+        playMutex.withLock {
+            if (released.get()) return@withLock
+            try {
+                if (!state.mp.vlcVout.areViewsAttached()) {
+                    state.mp.attachViews(vlcVideoLayout, null, true, false)
+                }
+                val w = vlcVideoLayout.width; val h = vlcVideoLayout.height
+                if (w > 0 && h > 0) state.mp.vlcVout.setWindowSize(w, h)
+            } catch (e: Exception) { Log.e(TAG, "attachViews failed: ${e.message}") }
+
+            val ok = withContext(Dispatchers.IO) {
+                if (released.get()) false
+                else playUrl(state.mp, state.vlc, urlSnapshot, released, isMuted)
+            }
+            if (!ok) { hasError.set(true); hasStreamErr = true; isBuffering = false }
+        }
+
+        reconnectJobRef.value = scope.launch(Dispatchers.IO) {
+            delay(10_000)
+            while (isActive && !released.get()) {
+                delay(8_000)
+                if (released.get()) break
+                // isPlaying is a native call -- only touch it under the mutex
+                // with the released guard, so it can't race teardown.
+                val stillPlaying = playMutex.withLock {
+                    if (released.get()) return@withLock true  // pretend healthy; loop will exit
+                    try { !hasError.get() && state.mp.isPlaying } catch (_: Exception) { false }
+                }
+                if (stillPlaying) continue
+                if (released.get()) break
+                val attempts = reconnectCount.incrementAndGet()
+                if (attempts > MAX_RECONNECT_ATTEMPTS) break
+                Log.w(TAG, "Watchdog reconnect #$attempts for $urlSnapshot")
+                hasError.set(false)
+                val ok = playMutex.withLock {
+                    if (released.get()) false
+                    else playUrl(state.mp, state.vlc, urlSnapshot, released, isMuted)
+                }
+                if (!ok) hasError.set(true)
+            }
+        }
+    }
+
+    // -- Cleanup on dispose ----------------------------------------------------
+    DisposableEffect(Unit) {
+        onDispose {
+            // Flip the guard FIRST so any watchdog iteration or play call that
+            // checks it (under the mutex) bails before touching native state.
+            released.set(true)
+            reconnectJobRef.value?.cancel()
+            val stateToRelease = playerState
+            playerState = null
+            if (stateToRelease != null) {
+                val tag = VlcTeardownExecutor.nextTag()
+                Log.d(TAG, "#$tag mini onDispose begin")
+
+                // Phase 1 -- stop events + detach the surface, BOUNDED.
+                // We still coordinate with the watchdog via playMutex (so a
+                // native call in flight finishes first), but we do it on the
+                // shared teardown thread with a hard time cap so nothing -- not
+                // this dispose, not the main thread -- can hang if the watchdog
+                // is mid native call. If the cap is hit, Phase 2 still detaches
+                // in order; worst case the surface-destroy path behaves as
+                // before. The bounded mutex grab avoids waiting forever on a
+                // contended mutex -- strictly better than the old unbounded
+                // runBlocking { withLock }.
+                VlcTeardownExecutor.runDetachBounded("mini detach", tag, 250L) {
+                    val locked = runBlocking {
+                        withTimeoutOrNull(150L) {
+                            playMutex.lock(); true
+                        } ?: false
+                    }
+                    try {
+                        try { stateToRelease.mp.setEventListener(null) } catch (_: Throwable) {}
+                        try { stateToRelease.mp.detachViews()           } catch (_: Throwable) {}
+                    } finally {
+                        if (locked) playMutex.unlock()
+                    }
+                }
+
+                // Phase 2 -- serialized native stop + release on the SAME thread
+                // the full player uses, so mini and full releases never overlap
+                // and never contend libVLC's mutex with each other.
+                VlcTeardownExecutor.submit("mini stop+release", tag) {
+                    try { stateToRelease.mp.stop()     } catch (_: Throwable) {}
+                    try { stateToRelease.mp.release()  } catch (_: Throwable) {}
+                    try { stateToRelease.vlc.release() } catch (_: Throwable) {}
+                }
+            }
+        }
+    }
+
+    // -- Render ----------------------------------------------------------------
+    Box(modifier = modifier) {
+
+        AndroidView(
+            factory = { _ ->
+                vlcVideoLayout.also { layout ->
+                    layout.viewTreeObserver.addOnGlobalLayoutListener(
+                        object : ViewTreeObserver.OnGlobalLayoutListener {
+                            override fun onGlobalLayout() {
+                                val w = layout.width; val h = layout.height
+                                if (w > 0 && h > 0 && !surfaceReady.value) {
+                                    layout.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                                    layout.post {
+                                        surfaceReady.value = true
+                                        Log.d(TAG, "Surface ready: ${w}x${h}")
+                                    }
+                                }
+                            }
+                        }
+                    )
+                }
+            },
+            update = { view ->
+                val mp = playerState?.mp ?: return@AndroidView
+                if (released.get()) return@AndroidView
+                val w = view.width; val h = view.height
+                // Guard against race with onDispose -- playerState may have been
+                // nulled on the main thread while this update lambda was pending.
+                if (w > 0 && h > 0 && playerState != null && !released.get() &&
+                    mp.vlcVout.areViewsAttached()
+                ) {
+                    try { mp.vlcVout.setWindowSize(w, h) } catch (_: Exception) {}
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Buffering spinner
+        AnimatedVisibility(
+            visible  = isBuffering && !streamUrl.isNullOrBlank(),
+            enter    = fadeIn(), exit = fadeOut(),
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            CircularProgressIndicator(
+                color = Color.White.copy(alpha = 0.7f),
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(32.dp)
+            )
+        }
+
+        // Error indicator
+        AnimatedVisibility(
+            visible  = hasStreamErr && !isBuffering && !streamUrl.isNullOrBlank(),
+            enter    = fadeIn(), exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color.Black.copy(alpha = 0.7f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "\u26A0 " + stringResourceSafe(context, R.string.mini_player_retrying, "Retrying..."),
+                    color = Color(0xFFFBBF24),
+                    fontSize = 11.sp
+                )
+            }
+        }
+
+        // Resolution badge -- top-end, clear of the bottom-end mute button and
+        // the top-start error chip. Same amber styling as the full player's
+        // pill, shrunk for the small tile. Gated on the shared "Show
+        // resolution" toggle, so it only appears when the user enabled it and
+        // the stream's Vout has reported a width.
+        if (!streamUrl.isNullOrBlank() && resolutionLabel.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color(0xFFFBBF24).copy(alpha = 0.18f))
+                    .border(1.dp, Color(0xFFFBBF24).copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = resolutionLabel,
+                    color = Color(0xFFFBBF24),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // Mute button -- plain Box+clickable works on both touch and D-pad
+        if (!streamUrl.isNullOrBlank()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
+                    .clickable { isMuted = !isMuted },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text     = if (isMuted) "\uD83D\uDD07" else "\uD83D\uDD0A",
+                    fontSize = 15.sp,
+                    color    = Color.White
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Resolves a string resource, falling back to [fallback] if the resource id
+ * isn't present (lets this file compile/run even if the string hasn't been
+ * added to strings.xml yet). Once mini_player_retrying exists, the fallback
+ * is never used.
+ */
+private fun stringResourceSafe(context: android.content.Context, resId: Int, fallback: String): String {
+    return try {
+        context.getString(resId)
+    } catch (_: Exception) {
+        fallback
+    }
+}
+
+/**
+ * Plays [url] on [mp]. Returns true on success.
+ *
+ * The [released] guard is re-checked immediately before each native call so a
+ * teardown that happens between the caller's mutex acquisition and these calls
+ * still can't dereference freed native memory. (Caller already holds the mutex
+ * and has checked released once; this is defence in depth for the window
+ * inside the function.)
+ */
+private fun playUrl(
+    mp: MediaPlayer,
+    vlc: LibVLC,
+    url: String,
+    released: AtomicBoolean,
+    muted: Boolean
+): Boolean {
+    if (released.get()) return false
+    return try {
+        mp.stop()
+        if (released.get()) return false
+        Log.d("MiniDiag", "playUrl url=$url")
+        val media = Media(vlc, Uri.parse(url)).apply {
+            addOption(":http-user-agent=Mozilla/5.0 (QtEmbedded; MAG254 stb) WebKit")
+            addOption(":aspect-ratio=16:9")
+            addOption(":network-caching=2000")
+        }
+        if (released.get()) { media.release(); return false }
+        mp.media = media
+        media.release()
+        mp.play()
+        try { mp.volume = if (muted) 0 else 100 } catch (_: Exception) {}
+        true
+    } catch (e: Exception) {
+        Log.e(TAG, "playUrl failed: ${e.message}")
+        false
+    }
+}
