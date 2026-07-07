@@ -148,7 +148,8 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
     private var hasPipSupport = false
     private var isTV = false
 
-    private var currentBuffering: Float = 100f
+    @Volatile private var currentBuffering: Float = 100f
+
     private var lastDecodedFrames = 0
     private var lastDecodedUpdateTs = 0L
 
@@ -1042,13 +1043,12 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                     if (mp.vlcVout?.areViewsAttached() == false)
                         mp.attachViews(binding.playerView, null, false, false)
                     mp.media = media
-                    media.release()
                     mp.play()
                 } catch (e: Exception) {
                     Log.w("PlayerActivity", "softReconnect: playback failed: ${e.message}")
                 } finally {
-                    // Always exactly one release: balances the Media() constructor's
-                    // initial refcount; the player retains its own ref via mp.media = media
+                    // Exactly one release: balances the Media() constructor's initial
+                    // refcount; the player retains its own ref via mp.media = media
                     try { media.release() } catch (_: Exception) {}
                 }
             }
@@ -1093,10 +1093,10 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                     if (mp.vlcVout?.areViewsAttached() == false)
                         mp.attachViews(binding.playerView, null, false, false)
                     mp.media = media
-                    media.release()
                     mp.play()
                 } catch (e: Exception) {
                     Log.w("PlayerActivity", "liveEndReachedReconnect: playback failed: ${e.message}")
+                } finally {
                     try { media.release() } catch (_: Exception) {}
                 }
             }
@@ -1588,10 +1588,24 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                     else userInfo to ""
                     ":http-user=${vlcUser}" to ":http-pwd=${vlcPass}"
                 } else null
-                // HLS detection has to happen here off finalUrl because
+// HLS detection has to happen here off finalUrl because
                 // lastStreamUrl (and therefore isHlsUrl) isn't set yet --
                 // that assignment lives in the withContext(Main) block below.
                 val isHls = finalUrl.contains(".m3u8", ignoreCase = true)
+                // Crash-loop breaker: if the last attempt at THIS stream
+                // died before Playing (native assert in the adaptive
+                // demuxer aborts the process with no EncounteredError),
+                // its marker is still on disk. Consume it once and start
+                // this attempt on the legacy demuxer directly.
+                val markerKey = "$portalId|${channel.id}"
+                val preemptLegacy = isHls &&
+                        HlsCrashMarker.matches(this@PlayerActivity, markerKey)
+                if (preemptLegacy) {
+                    HlsCrashMarker.clear(this@PlayerActivity)
+                    forceLegacyHlsDemux = true
+                    Log.w("PlayerActivity",
+                        "Previous attempt at this HLS stream died pre-Playing -> preemptive legacy demux")
+                }
                 val media = Media(libVLC, Uri.parse(vlcUrl)).apply {
                     addOption(":http-user-agent=$ua"); addOption(":http-referrer=$ref")
                     if (isXtreamUrl) addOption(":network-caching=3000")
@@ -1606,13 +1620,18 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                     // fallback rather than the default.
                     if (isHls && forceLegacyHlsDemux) addOption(":demux=hls")
                 }
+// Arm the marker on the IO thread (synchronous commit --
+                // must hit disk before play() can possibly abort us).
+                // Live HLS only: that's the only known assert path.
+                if (isHls) HlsCrashMarker.write(this@PlayerActivity, markerKey)
                 withContext(Dispatchers.Main) {
                     lastStreamUrl = finalUrl; lastStreamUserAgent = ua; lastStreamReferrer = ref
                     reconnectAttempts = 0; endReachedAttempts = 0; lastReconnectTs = 0L
-                    // New channel -> start on the adaptive demuxer. The
-                    // EncounteredError handler flips this true if this stream
-                    // turns out to need the legacy demuxer.
-                    forceLegacyHlsDemux = false
+                    // New channel -> adaptive demuxer, unless the crash
+                    // marker just told us this stream killed the process
+                    // last time. The EncounteredError handler still flips
+                    // this true for soft failures.
+                    forceLegacyHlsDemux = preemptLegacy
                     isChannelSwitching = false
                     streamResolutionLabel = ""  // reset -- Vout event will repopulate
                     startPlayback(media)
@@ -1664,6 +1683,9 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                 MediaPlayer.Event.Playing -> {
                     reconnectAttempts = 0; endReachedAttempts = 0; lastReconnectTs = 0L
                     lastDecodedFrames = 0; lastDecodedUpdateTs = System.currentTimeMillis()
+                    // Playback reached Playing -> the demuxer survived
+                    // startup. Disarm the crash-loop marker.
+                    if (!isVOD) HlsCrashMarker.clear(this@PlayerActivity)
                     if (!isVOD) startStatsPolling()
                     binding.progressBar.visibility = View.GONE
                     binding.playPauseButton.setImageResource(R.drawable.ic_pause)
@@ -1671,6 +1693,7 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
                     if (isVOD) {
                         val duration = mediaPlayer?.length ?: 0
                         binding.totalDuration.text = formatTime(duration)
+                        progressUpdateHandler.removeCallbacks(updateProgressRunnable)
                         progressUpdateHandler.post(updateProgressRunnable)
                         if (!hasShownResumeDialog && (mediaPlayer?.time ?: 0) < 2000) checkAndResumePlayback()
                     }
@@ -1846,8 +1869,18 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
         // Phase 1 -- synchronous on the current (main) thread.
         // Stop event callbacks first so no new JNI bounce starts, then detach
         // the surface (bounded) before the system can destroy it.
+// Detach directly on the main thread rather than via the shared
+        // executor. The bounded-executor version queued this detach BEHIND any
+        // in-flight channel-switch release; if that release held libVLC's mutex
+        // past the 250ms cap, the wait aborted, the surface stayed attached, and
+        // performStop re-entered setVideoTrack -> vlc_mutex_lock (the ANR). A
+        // direct detach isn't queued: it grabs the mutex the moment it's free,
+        // so it only blocks if a release is *actively* in the mutex, and once it
+        // returns the surface is severed and performStop's surfaceDestroyed is a
+        // no-op. detachViews is already called off-executor in the channel-switch
+        // path, so this isn't new behaviour for it.
         try { mpToRelease?.setEventListener(null) } catch (_: Throwable) {}
-        detachSurfaceBounded(mpToRelease, tag)
+        try { mpToRelease?.detachViews() } catch (_: Throwable) {}
 
         // Phase 2 -- serialized native release on the shared single-thread executor.
         VlcTeardownExecutor.submit("full stop+release", tag) {
@@ -1936,7 +1969,6 @@ fun ChannelMenuOverlay(
         else categoryNames.indices.filter { matchesCategoryQuery(categoryNames[it], categoryQuery) }
     }
 
-    // Auto-scroll focused channel into view
     // Auto-scroll focused channel into view. The try/catch protects against
     // a Compose-internal race: the LazyListState can be out of sync with
     // our computed filteredChannels.size mid-recomposition, throwing
@@ -2287,7 +2319,7 @@ private fun CategoryRail(
                                     shape = RoundedCornerShape(10.dp)
                                 )
                                 .clickable { onCategorySelected(originalIdx) }
-                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -2297,7 +2329,7 @@ private fun CategoryRail(
                                     Box(
                                         modifier = Modifier
                                             .width(3.dp)
-                                            .height(22.dp)
+                                            .height(18.dp)
                                             .clip(RoundedCornerShape(2.dp))
                                             .background(Color(0xFF378ADD))
                                     )
@@ -2310,7 +2342,7 @@ private fun CategoryRail(
                                         isActive  -> Color.White.copy(alpha = 0.9f)
                                         else      -> Color.White.copy(alpha = 0.7f)
                                     },
-                                    fontSize = 12.sp,
+                                    fontSize = 11.sp,
                                     fontWeight = if (isFocused || isActive) FontWeight.SemiBold else FontWeight.Normal,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -2449,6 +2481,7 @@ private fun ChannelListPane(
 }
 
 // ___ ChannelRow -- only the focused row gets a near-opaque background ________
+// Compact sizing (text reduced ~25%) so more rows fit on screen.
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun ChannelRow(
@@ -2459,16 +2492,27 @@ private fun ChannelRow(
     onSelect: () -> Unit,
     onFavoriteToggle: () -> Unit
 ) {
-    // EPG now-event for the row's secondary line
+// EPG now-event for the row's secondary line
     var epgNow by remember(channel.id) { mutableStateOf<StalkerEpgEvent?>(null) }
+    // EPG-derived channel icon. Resolved AFTER getBestEpg warms the EPG cache,
+    // on the same background pass as the now-event. A plain
+    // remember { iconFor() } ran at first composition -- before this effect
+    // warms the cache -- so it captured an empty result and froze it, which
+    // is why the fallback logo never populated the way it does in ContentBrowse.
+    var epgIcon by remember(channel.id) { mutableStateOf<String?>(null) }
     LaunchedEffect(channel.id) {
-        epgNow = withContext(Dispatchers.Default) { EpgRepository.getBestEpg(channel).first }
+        val (now, icon) = withContext(Dispatchers.Default) {
+            val n = EpgRepository.getBestEpg(channel).first
+            n to EpgRepository.iconFor(channel)
+        }
+        epgNow = now
+        epgIcon = icon
     }
 
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 3.dp)
+            .padding(horizontal = 12.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(
                 when {
@@ -2486,7 +2530,7 @@ private fun ChannelRow(
                 onClick = onSelect,
                 onLongClick = onFavoriteToggle
             )
-            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .padding(horizontal = 12.dp, vertical = 6.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Accent bar on focused row
@@ -2494,39 +2538,50 @@ private fun ChannelRow(
                 Box(
                     modifier = Modifier
                         .width(3.dp)
-                        .height(34.dp)
+                        .height(26.dp)
                         .clip(RoundedCornerShape(2.dp))
                         .background(Color(0xFF378ADD))
                 )
                 Spacer(Modifier.width(10.dp))
             }
 
-            // Logo / initial
+            // Logo / initial -- staged fallback: channel logo -> EPG icon -> letter badge.
+            // onError advances the stage so a failed load drops to the next source
+            // (a broken/404 logo URL no longer leaves an empty tinted box).
             Box(
                 modifier = Modifier
-                    .size(34.dp)
+                    .size(26.dp)
                     .clip(RoundedCornerShape(6.dp))
                     .background(Color(0xFF378ADD).copy(alpha = if (isFocused) 0.30f else 0.25f)),
                 contentAlignment = Alignment.Center
             ) {
-                val logoUrl = channel.logo ?: EpgRepository.iconFor(channel)
-                if (!logoUrl.isNullOrBlank()) {
-                    AsyncImage(
-                        model = logoUrl,
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))
-                    )
-                } else {
+                val primary = channel.logo?.takeIf { it.startsWith("http") }
+                val fallback = epgIcon
+                // stage 0 = try primary, 1 = try EPG icon, 2 = letter badge
+                var stage by remember(channel.id) { mutableStateOf(if (primary != null) 0 else 1) }
+                val model = when (stage) {
+                    0    -> primary
+                    1    -> fallback
+                    else -> null
+                }
+                if (model.isNullOrBlank()) {
                     androidx.compose.material3.Text(
                         channel.name.take(2).uppercase(),
                         color = Color.White.copy(alpha = 0.9f),
-                        fontSize = 12.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.SemiBold
+                    )
+                } else {
+                    AsyncImage(
+                        model = model,
+                        contentDescription = null,
+                        onError = { stage++ },
+                        modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))
                     )
                 }
             }
 
-            Spacer(Modifier.width(12.dp))
+            Spacer(Modifier.width(10.dp))
 
             // Name + EPG line
             Column(modifier = Modifier.weight(1f)) {
@@ -2537,7 +2592,7 @@ private fun ChannelRow(
                         isPlaying -> Color.White.copy(alpha = 0.9f)
                         else -> Color.White.copy(alpha = 0.85f)
                     },
-                    fontSize = 13.sp,
+                    fontSize = 10.sp,
                     fontWeight = if (isFocused || isPlaying) FontWeight.SemiBold else FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -2546,7 +2601,7 @@ private fun ChannelRow(
                     androidx.compose.material3.Text(
                         text = "\u25B6 ${epgNow!!.title}",
                         color = Color(0xFF93C5FD).copy(alpha = if (isFocused) 0.9f else 0.6f),
-                        fontSize = 10.sp,
+                        fontSize = 8.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.padding(top = 2.dp)
@@ -2574,7 +2629,7 @@ private fun ChannelRow(
                         androidx.compose.material3.Text(
                             stringResource(R.string.home_live_badge),
                             color = Color(0xFFFCA5A5),
-                            fontSize = 9.sp,
+                            fontSize = 7.sp,
                             fontWeight = FontWeight.SemiBold
                         )
                     }
@@ -2586,7 +2641,7 @@ private fun ChannelRow(
             // Favourite star
             Box(
                 modifier = Modifier
-                    .size(28.dp)
+                    .size(24.dp)
                     .clip(RoundedCornerShape(6.dp))
                     .background(
                         if (isFav) Color(0xFFFBBF24).copy(alpha = 0.18f)
@@ -2598,7 +2653,7 @@ private fun ChannelRow(
                 androidx.compose.material3.Text(
                     if (isFav) stringResource(R.string.star_icon) else stringResource(R.string.star_outline_icon),
                     color = if (isFav) Color(0xFFFBBF24) else Color.White.copy(alpha = 0.35f),
-                    fontSize = 13.sp
+                    fontSize = 10.sp
                 )
             }
         }
