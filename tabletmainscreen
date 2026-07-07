@@ -13,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import kotlinx.coroutines.flow.debounce
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -107,6 +108,9 @@ fun TabletMainScreen(
     // composable shows and walks the user through PIN setup for a brand-new
     // lock action. Same pattern as TV and phone.
     var genreAwaitingPinSetup by remember { mutableStateOf<StalkerGenre?>(null) }
+
+    // EPG override picker trigger -- opened from a channel row's dots menu.
+    var channelForEpgOverride by remember { mutableStateOf<Channel?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -316,7 +320,8 @@ fun TabletMainScreen(
                                 selectedChannel = ch
                                 // Single tap selects; double-tap (or Play button) launches
                             },
-                            onVisibleChannelsChanged = onVisibleChannelsChanged
+                            onVisibleChannelsChanged = onVisibleChannelsChanged,
+                            onAssignEpg = { channelForEpgOverride = it }
                         )
                     contentType == ContentType.VOD ->
                         TabletVodList(items = filteredVod, selectedVod = selectedVod,
@@ -655,14 +660,25 @@ private fun TabletChannelList(
     channels: List<Channel>,
     selectedChannel: Channel?,
     onChannelClick: (Channel) -> Unit,
-    onVisibleChannelsChanged: (List<Channel>) -> Unit
+    onVisibleChannelsChanged: (List<Channel>) -> Unit,
+    onAssignEpg: (Channel) -> Unit = {}
 ) {
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
 
-    LaunchedEffect(listState.firstVisibleItemIndex, listState.layoutInfo.visibleItemsInfo.size) {
-        val visible = listState.layoutInfo.visibleItemsInfo.mapNotNull { channels.getOrNull(it.index) }
-        delay(200)
-        onVisibleChannelsChanged(visible)
+    // snapshotFlow keeps layoutInfo reads OUT of composition (reading it in
+    // a composable key recomposes every scroll frame), debounce fires once
+    // per scroll-rest, and keying on channels prevents stale reports after
+    // a category switch. Same fix as the phone's ChannelList.
+    LaunchedEffect(listState, channels) {
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.layoutInfo.visibleItemsInfo.size
+        }
+            .debounce(200)
+            .collect {
+                val visible = listState.layoutInfo.visibleItemsInfo
+                    .mapNotNull { channels.getOrNull(it.index) }
+                if (visible.isNotEmpty()) onVisibleChannelsChanged(visible)
+            }
     }
 
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize(),
@@ -690,19 +706,7 @@ private fun TabletChannelList(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Logo
-                Box(modifier = Modifier.size(36.dp).clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.05f)),
-                    contentAlignment = Alignment.Center) {
-                    if (!channel.logo.isNullOrBlank()) {
-                        AsyncImage(model = channel.logo, contentDescription = null,
-                            modifier = Modifier.fillMaxSize().clip(CircleShape),
-                            contentScale = ContentScale.Crop)
-                    } else {
-                        Text(channel.name.take(1).uppercase(), color = AccentBlue,
-                            fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
+                ChannelLogo(channel = channel, size = 36.dp)
                 // Name + now playing
                 Column(modifier = Modifier.weight(1f)) {
                     Text(channel.name, color = if (isSelected) TextPrimary else TextPrimary,
@@ -714,6 +718,16 @@ private fun TabletChannelList(
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
+                RowActionMenu(
+                    items = listOf(
+                        RowAction(
+                            label = stringResource(R.string.menu_epg_override),
+                            onClick = { onAssignEpg(channel) }
+                        )
+                    ),
+                    cornerEnd = 8.dp,
+                    tint = AccentBlue
+                )
                 if (isSelected) {
                     Box(modifier = Modifier.width(3.dp).height(20.dp)
                         .background(AccentBlue, RoundedCornerShape(2.dp)))
