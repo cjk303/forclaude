@@ -1,0 +1,1732 @@
+package com.kam.magplayer
+
+import android.app.Activity
+import android.content.Intent
+import android.os.Bundle
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.BackHandler
+import android.util.Log
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
+import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.painter.ColorPainter
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.tv.material3.*
+import androidx.compose.material3.Text
+import coil.compose.AsyncImage
+import com.kam.magplayer.epg.EpgRepository
+import com.kam.magplayer.epg.MagEpg
+import com.kam.magplayer.epg.StalkerEpgClient
+import com.kam.magplayer.epg.XtreamEpgClient
+import com.kam.magplayer.epg.XmlTvLoader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+// Poster grid column count for VOD/SERIES. Single source of truth so the
+// scroll-by-row math and prefetch trigger below stay in lockstep with the
+// LazyVerticalGrid's GridCells.Fixed value.
+private const val POSTER_GRID_COLUMNS = 6
+
+// ── Resolved URL cache ────────────────────────────────────────────────────────
+private object ResolvedUrlCache {
+    private const val MAX_SIZE = 100
+    private val map = LinkedHashMap<String, String>(MAX_SIZE, 0.75f, true)
+
+    // Synchronized because get() runs on Dispatchers.IO (stream resolution)
+    // while clear() runs on the main thread (onDestroyView). With
+    // accessOrder=true this map mutates its internal links ON READ, so an
+    // unsynchronized concurrent get/clear can corrupt the link structure.
+    @Synchronized fun get(key: String): String? = map[key]
+
+    @Synchronized fun put(key: String, value: String) {
+        if (map.size >= MAX_SIZE) {
+            map.iterator().let { it.next(); it.remove() }
+        }
+        map[key] = value
+    }
+
+    @Synchronized fun clear() = map.clear()
+}
+
+// ── Region accent colour system ───────────────────────────────────────────────
+
+private val contentRegionColors = mapOf(
+    "PL" to Color(0xFF3B82F6),
+    "EN" to Color(0xFF10B981),
+    "UK" to Color(0xFF10B981),
+    "US" to Color(0xFF10B981),
+    "DE" to Color(0xFFF59E0B),
+    "FR" to Color(0xFF6366F1),
+    "IT" to Color(0xFF22C55E),
+    "ES" to Color(0xFFEF4444),
+    "NL" to Color(0xFFF97316),
+    "PT" to Color(0xFF84CC16),
+    "RU" to Color(0xFFEC4899),
+    "RS" to Color(0xFFA78BFA),
+    "HR" to Color(0xFF0EA5E9),
+    "SK" to Color(0xFF3B82F6),
+    "CZ" to Color(0xFF3B82F6),
+    "HU" to Color(0xFFF59E0B),
+    "RO" to Color(0xFFF59E0B),
+    "BG" to Color(0xFF6366F1),
+    "GR" to Color(0xFF3B82F6),
+    "SE" to Color(0xFFFBBF24),
+    "NO" to Color(0xFFEF4444),
+    "DK" to Color(0xFFEF4444),
+    "FI" to Color(0xFF3B82F6),
+    "TR" to Color(0xFFEF4444),
+    "ARAB"   to Color(0xFF14B8A6),
+    "AR"     to Color(0xFF14B8A6),
+    "AFR"    to Color(0xFFF97316),
+    "AFRICA" to Color(0xFFF97316),
+    "IN"     to Color(0xFFF59E0B),
+    "PK"     to Color(0xFF22C55E),
+    "BD"     to Color(0xFF22C55E),
+    "CN"     to Color(0xFFEF4444),
+    "JP"     to Color(0xFFEC4899),
+    "KR"     to Color(0xFF8B5CF6),
+    "TH"     to Color(0xFF8B5CF6),
+    "VIP"    to Color(0xFFFBBF24),
+    "4K"     to Color(0xFF8B5CF6),
+    "UHD"    to Color(0xFF8B5CF6),
+    "FHD"    to Color(0xFF6366F1),
+    "XXX"    to Color(0xFFEF4444),
+    "ADULT"  to Color(0xFFEF4444),
+)
+
+@Composable
+private fun ChannelLogo(
+    channel: Channel,
+    accent: Color,
+    modifier: Modifier = Modifier
+) {
+    val primary = channel.logo?.takeIf { it.startsWith("http") }
+
+    // Reactive EPG-icon fallback. A plain remember { iconFor() } evaluated
+    // ONCE at first composition -- before the XMLTV (and its icons) had
+    // loaded -- and froze the null result, so rows composed during the EPG
+    // download never got their fallback logo. (Same bug fixed in the player
+    // overlay's ChannelRow in 1.3.7; the TTL fix made it visible here by
+    // delaying icon publication behind a real network download.)
+    // xmltvVersion bumps right after putXmlTvIcons in the same load pass,
+    // so re-resolving on it picks the icons up the moment they exist.
+    val xmltvVersion by EpgRepository.xmltvVersion.collectAsState()
+    var fallback by remember(channel.id) { mutableStateOf<String?>(null) }
+    LaunchedEffect(channel.id, xmltvVersion) {
+        fallback = withContext(Dispatchers.Default) { EpgRepository.iconFor(channel) }
+    }
+
+    // Step through: primary -> EPG icon -> letter badge.
+    // stage 0 = try primary, 1 = try EPG fallback, 2 = letter badge
+    var stage by remember(channel.id) { mutableStateOf(if (primary != null) 0 else 1) }
+
+    val model = when (stage) {
+        0 -> primary
+        1 -> fallback
+        else -> null
+    }
+
+    if (model == null) {
+        Box(
+            modifier = modifier.background(accent.copy(alpha = 0.9f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = channel.name.trim().firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    } else {
+        AsyncImage(
+            model = coil.request.ImageRequest.Builder(LocalContext.current)
+                .data(model)
+                .size(84, 84)
+                .allowHardware(DeviceInfo.allowHardwareBitmaps)
+                .build(),
+            contentDescription = channel.name,
+            onError = { stage++ },   // this source failed -> advance to the next
+            modifier = modifier,
+            contentScale = ContentScale.Crop
+        )
+    }
+}
+private val contentDefaultAccent = Color(0xFF64748B)
+
+private fun contentExtractPrefix(name: String): String {
+    val pipeIdx = name.indexOf('|')
+    if (pipeIdx > 0) return name.substring(0, pipeIdx).trim().uppercase()
+    val firstWord = name.substringBefore(' ').trim().uppercase()
+    return if (contentRegionColors.containsKey(firstWord)) firstWord else ""
+}
+
+private fun contentAccentFor(name: String): Color {
+    val prefix = contentExtractPrefix(name)
+    return contentRegionColors[prefix] ?: contentDefaultAccent
+}
+
+private fun contentStripPrefix(name: String): Pair<String, String> {
+    val pipeIdx = name.indexOf('|')
+    return if (pipeIdx > 0) {
+        val prefix = name.substring(0, pipeIdx).trim()
+        val rest   = name.substring(pipeIdx + 1).trim()
+        prefix to rest
+    } else {
+        val firstWord = name.substringBefore(' ').trim()
+        if (contentRegionColors.containsKey(firstWord.uppercase()))
+            firstWord to name.substring(firstWord.length).trim()
+        else "" to name
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ContentBrowseComposeFragment : Fragment() {
+
+    private var contentType: ContentType? = null
+    private var categoryId: String? = null
+    private var categoryName: String? = null
+    private var activePortal: Portal? = null
+
+    private var stalkerClient: StalkerClient? = null
+    private var vodClient: VodClient? = null
+    private var xtreamClient: XtreamClient? = null
+
+    private val allContent = mutableStateListOf<Any>()
+    private var isLoading by mutableStateOf(false)
+    private var loadingMessage by mutableStateOf("")
+    private var searchQuery by mutableStateOf("")
+
+    private var nextPageToLoad: Int = 0
+    // Volatile: claimed on the main thread (requestNextPage) and
+    // read/cleared on Dispatchers.IO (loadPage).
+    @Volatile private var isPageLoading: Boolean = false
+    @Volatile private var reachedEnd: Boolean = false
+
+    private var pendingFilterRestore: String? = null
+
+    private val playerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result: ActivityResult ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            pendingFilterRestore = result.data?.getStringExtra("FILTER") ?: ""
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        arguments?.let {
+            contentType = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU)
+                it.getSerializable(ARG_CONTENT_TYPE, ContentType::class.java)
+            else
+                @Suppress("DEPRECATION") it.getSerializable(ARG_CONTENT_TYPE) as? ContentType
+            categoryId   = it.getString(ARG_CATEGORY_ID)
+            categoryName = it.getString(ARG_CATEGORY_NAME)
+        }
+    }
+
+
+
+    @OptIn(ExperimentalTvMaterial3Api::class)
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            setContent {
+                MaterialTheme {
+                    ContentBrowseScreen(
+                        contentType            = contentType!!,
+                        categoryName           = categoryName!!,
+                        contentItems           = allContent,
+                        isLoading              = isLoading,
+                        loadingMessage         = loadingMessage,
+                        onItemSelected         = { item -> handleItemSelection(item) },
+                        activePortal           = activePortal,
+                        onLoadMore             = { requestNextPage() },
+                        externalSearchQuery    = searchQuery,
+                        onSearchQueryChanged   = { searchQuery = it },
+                        onNavigate             = { frag -> tvGoTopLevel(frag) }
+                    )
+                }
+            }
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        loadContentInitial()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        allContent.clear()
+        ResolvedUrlCache.clear()
+        Log.d("ContentBrowse", "onDestroyView — content list and URL cache cleared")
+    }
+
+    private fun loadContentInitial() {
+        val type  = contentType ?: return
+        val catId = categoryId  ?: return
+
+        // Paging state must not survive a reload. A stale reachedEnd=true
+        // from a previous life of this fragment (back stack restore, error
+        // path) would silently kill pagination for the new content.
+        reachedEnd     = false
+        isPageLoading  = false
+        nextPageToLoad = 0
+
+        isLoading      = true
+        loadingMessage = getString(R.string.loading)
+
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            if (activePortal == null) {
+                val repo = PortalRepository(requireContext())
+                val portal = repo.getPortals().find { it.id == repo.getActivePortalId() }
+                withContext(Dispatchers.Main) { activePortal = portal }
+                portal?.let { p ->
+                    when {
+                        p.isXtream -> xtreamClient = XtreamClient(p.effectiveUrl, p.username, p.password)
+                        p.isM3U    -> { /* no client needed */ }
+                        else       -> {
+                            stalkerClient = StalkerClient(p.effectiveUrl, p.macAddress)
+                            vodClient     = VodClient(p.effectiveUrl, p.macAddress)
+                        }
+                    }
+                }
+            }
+
+            val portal = activePortal ?: run {
+                withContext(Dispatchers.Main) { isLoading = false }
+                return@launch
+            }
+            val cache = PortalCache.get(portal.id)
+            val cachedItems: List<Any> = when (type) {
+                ContentType.IPTV -> {
+                    val pageMap = cache.channelPagesByGenre[catId]
+                    if (pageMap != null && pageMap.isNotEmpty()) {
+                        val sorted = pageMap.keys.sorted()
+                        nextPageToLoad = (sorted.maxOrNull() ?: 0) + 1
+                        sorted.flatMap { pageMap[it].orEmpty() }
+                    } else { nextPageToLoad = 1; emptyList() }
+                }
+                ContentType.VOD -> {
+                    val pageMap = cache.vodPagesByCategory[catId]
+                    if (pageMap != null && pageMap.isNotEmpty()) {
+                        val sorted = pageMap.keys.sorted()
+                        nextPageToLoad = (sorted.maxOrNull() ?: 0) + 1
+                        sorted.flatMap { pageMap[it].orEmpty() }
+                    } else { nextPageToLoad = 1; emptyList() }
+                }
+                ContentType.SERIES -> {
+                    val pageMap = cache.seriesPagesByCategory[catId]
+                    if (pageMap != null && pageMap.isNotEmpty()) {
+                        val sorted = pageMap.keys.sorted()
+                        nextPageToLoad = (sorted.maxOrNull() ?: 0) + 1
+                        sorted.flatMap { pageMap[it].orEmpty() }
+                    } else { nextPageToLoad = 1; emptyList() }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                if (cachedItems.isNotEmpty()) {
+                    allContent.clear()
+                    allContent.addAll(cachedItems)
+                    isLoading      = false
+                    loadingMessage = ""
+                }
+            }
+
+            if (cachedItems.isEmpty()) {
+                loadPage(type, portal, cache, catId, nextPageToLoad, append = false)
+            } else if (type == ContentType.IPTV) {
+                prefetchEpgForChannels(portal, cachedItems.filterIsInstance<Channel>())
+            }
+        }
+    }
+
+    private fun requestNextPage() {
+        val portal = activePortal ?: return
+        val type   = contentType  ?: return
+        val catId  = categoryId   ?: return
+        if (reachedEnd || isPageLoading) return
+        // Claim BEFORE launching. The old code claimed inside loadPage on
+        // the IO thread, leaving a window where two rapid onLoadMore calls
+        // both passed the guard and both launched a page load.
+        isPageLoading = true
+
+        val cache = PortalCache.get(portal.id)
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            loadPage(type, portal, cache, catId, nextPageToLoad,
+                append = allContent.isNotEmpty(), preClaimed = true)
+        }
+    }
+
+    private suspend fun loadPage(
+        type:       ContentType,
+        portal:     Portal,
+        cache:      PortalMemoryCache,
+        catId:      String,
+        page:       Int,
+        append:     Boolean,
+        retryCount: Int = 0,
+        preClaimed: Boolean = false
+    ) {
+        // preClaimed = true when the caller already set isPageLoading
+        // (requestNextPage's synchronous claim, or the retry recursion
+        // below -- which under the old guard ALWAYS bailed out instantly,
+        // because the outer call still held isPageLoading=true, so the
+        // retry never actually ran and a failed page left an infinite
+        // spinner).
+        if (reachedEnd) {
+            if (preClaimed) isPageLoading = false
+            return
+        }
+        if (!preClaimed && isPageLoading) return
+        isPageLoading = true
+
+        withContext(Dispatchers.Main) {
+            loadingMessage = getString(R.string.loading_page, page)
+            if (!append) isLoading = true
+        }
+
+        try {
+            val items: List<Any> = when (type) {
+                ContentType.IPTV -> {
+                    when {
+                        portal.isM3U -> {
+                            val channels = M3uCache.loadChannelsForCategory(
+                                requireContext(), portal.effectiveUrl, catId, ContentType.IPTV
+                            ) ?: emptyList()
+                            if (channels.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutChannelPage(catId)
+                                pageMap[1] = channels; reachedEnd = true
+                                prefetchEpgForChannels(portal, channels); channels
+                            }
+                        }
+                        portal.isXtream -> {
+                            val client = xtreamClient ?: XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                                .also { xtreamClient = it }
+                            val channels = client.getLiveStreams(catId)
+                            if (channels.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutChannelPage(catId)
+                                pageMap[1] = channels; reachedEnd = true
+                                prefetchEpgForChannels(portal, channels); channels
+                            }
+                        }
+                        else -> {
+                            val client = stalkerClient ?: StalkerClient(portal.effectiveUrl, portal.macAddress)
+                                .also { stalkerClient = it }
+                            val pageResult = client.getChannelsPage(catId, page, limit = 2000)
+                            val channels   = pageResult.channels
+                            if (channels.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutChannelPage(catId)
+                                pageMap[page] = channels
+                                if (pageResult.totalItems > 0)
+                                    cache.channelCountByGenre[catId] = pageResult.totalItems
+                                prefetchEpgForChannels(portal, channels); channels
+                            }
+                        }
+                    }
+                }
+
+                ContentType.VOD -> {
+                    when {
+                        portal.isM3U -> {
+                            val channels = M3uCache.loadChannelsForCategory(
+                                requireContext(), portal.effectiveUrl, catId, ContentType.VOD
+                            ) ?: emptyList()
+                            val vodItems = channels.map { ch ->
+                                VodItem(id = ch.id, name = ch.name, poster = ch.logo,
+                                    description = "", year = "", cmd = ch.cmd, isSeries = false, isMovie = true)
+                            }
+                            if (vodItems.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutVodPage(catId)
+                                pageMap[1] = vodItems; reachedEnd = true; vodItems
+                            }
+                        }
+                        portal.isXtream -> {
+                            val client = xtreamClient ?: XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                                .also { xtreamClient = it }
+                            val items = client.getVodStreams(catId)
+                            if (items.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutVodPage(catId)
+                                pageMap[1] = items; reachedEnd = true; items
+                            }
+                        }
+                        else -> {
+                            val client = vodClient ?: VodClient(portal.effectiveUrl, portal.macAddress)
+                                .also { vodClient = it }
+                            val pageResult = client.getVodItems(catId, page)
+                            if (pageResult.items.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutVodPage(catId)
+                                pageMap[page] = pageResult.items
+                                if (pageResult.totalItems > 0)
+                                    cache.vodCountByCategory[catId] = pageResult.totalItems
+                                pageResult.items
+                            }
+                        }
+                    }
+                }
+
+                ContentType.SERIES -> {
+                    when {
+                        portal.isM3U -> {
+                            val channels = M3uCache.loadChannelsForCategory(
+                                requireContext(), portal.effectiveUrl, catId, ContentType.SERIES
+                            ) ?: emptyList()
+                            val seriesItems = channels.map { ch ->
+                                VodItem(id = ch.id, name = ch.name, poster = ch.logo,
+                                    description = "", year = "", cmd = ch.cmd, isSeries = true, isMovie = false)
+                            }
+                            if (seriesItems.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutSeriesPage(catId)
+                                pageMap[1] = seriesItems; reachedEnd = true; seriesItems
+                            }
+                        }
+                        portal.isXtream -> {
+                            val client = xtreamClient ?: XtreamClient(portal.effectiveUrl, portal.username, portal.password)
+                                .also { xtreamClient = it }
+                            val items = client.getSeries(catId)
+                            if (items.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutSeriesPage(catId)
+                                pageMap[1] = items; reachedEnd = true; items
+                            }
+                        }
+                        else -> {
+                            val client = vodClient ?: VodClient(portal.effectiveUrl, portal.macAddress)
+                                .also { vodClient = it }
+                            val pageResult = client.getSeriesList(catId, page)
+                            if (pageResult.items.isEmpty()) { reachedEnd = true; emptyList() }
+                            else {
+                                val pageMap = cache.getOrPutSeriesPage(catId)
+                                pageMap[page] = pageResult.items
+                                if (pageResult.totalItems > 0)
+                                    cache.seriesCountByCategory[catId] = pageResult.totalItems
+                                pageResult.items
+                            }
+                        }
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                if (items.isNotEmpty()) {
+                    if (!append) allContent.clear()
+                    allContent.addAll(items)
+                    nextPageToLoad = page + 1
+                } else {
+                    reachedEnd = true
+                }
+                isLoading      = false
+                loadingMessage = ""
+            }
+        } catch (e: Exception) {
+            if (retryCount < 1) {
+                Log.e("CONTENT_PAGING", "Failed to load page $page — ${e.message}, retrying in 2s")
+                kotlinx.coroutines.delay(2000)
+                loadPage(type, portal, cache, catId, page, append, retryCount + 1, preClaimed = true)
+            } else {
+                Log.e("CONTENT_PAGING", "Retry also failed for page $page — ${e.message}")
+                withContext(Dispatchers.Main) {
+                    isLoading      = false
+                    loadingMessage = getString(R.string.loading_error)
+                }
+            }
+        } finally {
+            isPageLoading = false
+        }
+    }
+
+    private suspend fun prefetchEpgForChannels(portal: Portal, channels: List<Channel>) {
+        try {
+            val channelsToPreload = channels.take(20)
+            kotlinx.coroutines.coroutineScope {
+                if (portal.isXtream) {
+                    val baseUrl  = portal.effectiveUrl
+                    val username = portal.username.ifBlank { return@coroutineScope }
+                    val password = portal.password.ifBlank { return@coroutineScope }
+                    channelsToPreload.forEach { ch ->
+                        launch {
+                            val streamId = XtreamEpgClient.extractStreamId(ch.cmd) ?: return@launch
+                            if (EpgRepository.getXtreamEvents(streamId).isNotEmpty()) return@launch
+                            try {
+                                val events = XtreamEpgClient.getShortEpg(baseUrl, username, password, streamId)
+                                if (events.isNotEmpty()) EpgRepository.putXtreamEvents(streamId, events)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                } else if (portal.isM3U) {
+                    val uri      = android.net.Uri.parse(portal.effectiveUrl)
+                    val baseUrl  = "${uri.scheme}://${uri.host}:${uri.port}"
+                    val username = uri.getQueryParameter("username") ?: return@coroutineScope
+                    val password = uri.getQueryParameter("password") ?: return@coroutineScope
+                    channelsToPreload.forEach { ch ->
+                        launch {
+                            val streamId = XtreamEpgClient.extractStreamId(ch.cmd) ?: return@launch
+                            if (EpgRepository.getXtreamEvents(streamId).isNotEmpty()) return@launch
+                            try {
+                                val events = XtreamEpgClient.getShortEpg(baseUrl, username, password, streamId)
+                                if (events.isNotEmpty()) EpgRepository.putXtreamEvents(streamId, events)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                } else {
+                    Log.d("EPG_PREFETCH", "Stalker prefetch via MagEpg: ${channelsToPreload.size} channels")
+                    channelsToPreload.forEach { ch ->
+                        val key = ch.id.toString()
+                        if (EpgRepository.getStalkerEvents(key).isEmpty()) {
+                            MagEpg.request(key)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun handleItemSelection(item: Any) {
+        when (item) {
+            is Channel -> playIptvChannel(item)
+            is VodItem -> {
+                if (item.isSeries) {
+                    val portal = activePortal
+                    if (portal != null && portal.isM3U) playVodMovie(item)
+                    else {
+                        tvGoDrillDown(SeriesBrowseFragment.newInstance(item))
+                    }
+                } else {
+                    playVodMovie(item)
+                }
+            }
+        }
+    }
+
+    private fun playIptvChannel(channel: Channel) {
+        val portal = activePortal ?: return
+        val catId  = categoryId   ?: return
+
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.Default) {
+            val allChannels  = allContent.filterIsInstance<Channel>()
+            val currentIndex = allChannels.indexOf(channel)
+
+            withContext(Dispatchers.Main) {
+                if (currentIndex == -1) {
+                    android.widget.Toast.makeText(requireContext(), "Channel not found", android.widget.Toast.LENGTH_SHORT).show()
+                    return@withContext
+                }
+
+                val cache = PortalCache.get(portal.id)
+                val catList: List<Pair<String, String>> = when (contentType) {
+                    ContentType.IPTV   -> cache.genres.map { it.id to it.title }
+                    ContentType.VOD    -> cache.vodCategories.map { it.id to it.title }
+                    ContentType.SERIES -> cache.seriesCategories.map { it.id to it.title }
+                    else               -> emptyList()
+                }
+                val catIds   = catList.map { it.first }.toTypedArray()
+                val catNames = catList.map { it.second }.toTypedArray()
+
+                val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+                    putExtra("PORTAL_URL",    portal.effectiveUrl)
+                    putExtra("MAC_ADDRESS",   portal.macAddress)
+                    putExtra("PORTAL_ID",     portal.id)
+                    putExtra("CATEGORY_ID",   catId)
+                    putExtra("CATEGORY_NAME", categoryName ?: "")
+                    putExtra("CONTENT_TYPE",  contentType?.name ?: ContentType.IPTV.name)
+                    putExtra("CURRENT_INDEX", currentIndex)
+                    putExtra("EPG_URL",       portal.epgUrl.orEmpty())
+                    putExtra("FILTER",        searchQuery)
+                    putStringArrayListExtra("CAT_IDS",   ArrayList(catIds.toList()))
+                    putStringArrayListExtra("CAT_NAMES", ArrayList(catNames.toList()))
+                    if (portal.isXtream) {
+                        putExtra("IS_XTREAM",       true)
+                        putExtra("XTREAM_USERNAME", portal.username)
+                        putExtra("XTREAM_PASSWORD", portal.password)
+                    }
+                }
+                playerLauncher.launch(intent)
+            }
+        }
+    }
+
+    private fun playVodMovie(item: VodItem) {
+        val portal = activePortal ?: return
+
+        if (portal.isM3U || portal.isXtream) {
+            val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+                putExtra("VIDEO_URL",   item.cmd)
+                putExtra("VIDEO_ID",    item.id)
+                putExtra("TITLE",       item.name)
+                putExtra("PORTAL_URL",  portal.effectiveUrl)
+                putExtra("MAC_ADDRESS", portal.macAddress)
+            }
+            startActivity(intent)
+            return
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val client = vodClient ?: VodClient(portal.effectiveUrl, portal.macAddress).also { vodClient = it }
+            try {
+                val vodFile = client.getVodFile(item)
+                withContext(Dispatchers.Main) {
+                    val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+                        putExtra("VIDEO_URL",   vodFile.cmd)
+                        putExtra("VIDEO_ID",    item.id)
+                        putExtra("TITLE",       item.name)
+                        putExtra("PORTAL_URL",  portal.effectiveUrl)
+                        putExtra("MAC_ADDRESS", portal.macAddress)
+                    }
+                    startActivity(intent)
+                }
+            } catch (e: Exception) {
+                Log.e("VOD_PLAY", "Failed to resolve VOD URL for ${item.name}", e)
+            }
+        }
+    }
+
+    companion object {
+        private const val ARG_CONTENT_TYPE  = "content_type"
+        private const val ARG_CATEGORY_ID   = "category_id"
+        private const val ARG_CATEGORY_NAME = "category_name"
+
+        fun newInstance(
+            contentType:  ContentType,
+            categoryId:   String,
+            categoryName: String
+        ): ContentBrowseComposeFragment {
+            return ContentBrowseComposeFragment().apply {
+                arguments = Bundle().apply {
+                    putSerializable(ARG_CONTENT_TYPE, contentType)
+                    putString(ARG_CATEGORY_ID,        categoryId)
+                    putString(ARG_CATEGORY_NAME,      categoryName)
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun ContentBrowseScreen(
+    contentType:          ContentType,
+    categoryName:         String,
+    contentItems:         List<Any>,
+    isLoading:            Boolean,
+    loadingMessage:       String,
+    onItemSelected:       (Any) -> Unit,
+    activePortal:         Portal?,
+    onLoadMore:           () -> Unit,
+    externalSearchQuery:  String = "",
+    onSearchQueryChanged: ((String) -> Unit)? = null,
+    onNavigate:           (androidx.fragment.app.Fragment) -> Unit = {}
+) {
+    var searchQuery by remember { mutableStateOf(externalSearchQuery) }
+    LaunchedEffect(externalSearchQuery) {
+        if (externalSearchQuery != searchQuery) searchQuery = externalSearchQuery
+    }
+    var searchFocused by remember { mutableStateOf(false) }
+    val listFocusRequester = remember { FocusRequester() }
+
+    val categoryAccent = remember(categoryName) { contentAccentFor(categoryName) }
+    val (categoryPrefix, categoryDisplayName) = remember(categoryName) { contentStripPrefix(categoryName) }
+
+    val filteredContent by remember(searchQuery, contentItems) {
+        derivedStateOf {
+            if (searchQuery.isBlank()) contentItems
+            else contentItems.filter {
+                when (it) {
+                    is Channel -> it.name.contains(searchQuery, ignoreCase = true)
+                    is VodItem -> it.name.contains(searchQuery, ignoreCase = true)
+                    else       -> false
+                }
+            }
+        }
+    }
+
+    var selectedChannel by remember { mutableStateOf<Channel?>(null) }
+    var channelForEpgOverride by remember { mutableStateOf<Channel?>(null) }
+
+    // VOD/SERIES: the movie whose detail modal is currently open (null = closed).
+    var vodModalItem by remember { mutableStateOf<VodItem?>(null) }
+
+    // Favourite channels state
+    val context = LocalContext.current
+    var favoriteChannelIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val favRepo = remember(activePortal?.id) {
+        FavoriteChannelsRepository(context)
+    }
+
+    LaunchedEffect(activePortal?.id) {
+        val pid = activePortal?.id ?: return@LaunchedEffect
+        favoriteChannelIds = withContext(Dispatchers.IO) {
+            favRepo.getFavoriteChannels(pid).map { it.id }.toSet()
+        }
+    }
+
+    fun toggleFav(channel: Channel) {
+        val pid = activePortal?.id ?: return
+        val isFav = favRepo.toggleFavorite(pid, channel)
+        favoriteChannelIds = favRepo.getFavoriteChannels(pid).map { it.id }.toSet()
+        android.widget.Toast.makeText(
+            context,
+            if (isFav) "★ Added to favourites" else "Removed from favourites",
+            android.widget.Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    // Favourite VOD (movies) state -- parallel store to the channel favourites
+    // above, kept separate so movies and channels never share one list.
+    var favoriteVodIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val favVodRepo = remember(activePortal?.id) {
+        FavoriteVodRepository(context)
+    }
+
+    LaunchedEffect(activePortal?.id) {
+        val pid = activePortal?.id ?: return@LaunchedEffect
+        favoriteVodIds = withContext(Dispatchers.IO) {
+            favVodRepo.getFavorites(pid).map { it.id }.toSet()
+        }
+    }
+
+    fun toggleVodFav(item: VodItem) {
+        val pid = activePortal?.id ?: return
+        val isFav = favVodRepo.toggleFavorite(pid, item)
+        favoriteVodIds = favVodRepo.getFavorites(pid).map { it.id }.toSet()
+        android.widget.Toast.makeText(
+            context,
+            if (isFav) "★ Added to favourites" else "Removed from favourites",
+            android.widget.Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    var rawStreamUrl    by remember { mutableStateOf<String?>(null) }
+    var epgLoading      by remember { mutableStateOf(false) }
+    var selectedVodItem by remember { mutableStateOf<VodItem?>(null) }
+
+    val isMainPlayerActive by mainPlayerActive
+
+    LaunchedEffect(selectedChannel) {
+        val channel = selectedChannel
+        if (channel == null || channel.cmd.isNullOrBlank() || activePortal == null) {
+            rawStreamUrl = null
+            epgLoading   = false
+            return@LaunchedEffect
+        }
+
+        rawStreamUrl = null
+        val (epgNow, _) = EpgRepository.getBestEpg(channel)
+        if (epgNow == null) epgLoading = true
+
+        delay(400)
+
+        val url = withContext(Dispatchers.IO) {
+            val cmd = channel.cmd
+            when {
+                cmd.startsWith("http") -> cmd
+                ResolvedUrlCache.get(cmd) != null -> {
+                    Log.d("MiniPlayer", "URL cache hit for ${channel.name}")
+                    ResolvedUrlCache.get(cmd)
+                }
+                activePortal?.isXtream == true -> { val built = activePortal!!.xtreamStreamUrl(cmd); ResolvedUrlCache.put(cmd, built); built }
+                else -> try {
+                    val resolved = StalkerClient(activePortal.effectiveUrl, activePortal.macAddress)
+                        .resolveStreamUrl(cmd)
+                    if (resolved != null) ResolvedUrlCache.put(cmd, resolved)
+                    resolved
+                } catch (e: Exception) {
+                    Log.e("MiniPlayer", "resolveStreamUrl failed for ${channel.name}: ${e.message}")
+                    null
+                }
+            }
+        }
+
+        rawStreamUrl = url
+        epgLoading   = false
+    }
+
+    val miniPlayerUrl = if (isMainPlayerActive) null else rawStreamUrl
+
+    // Return focus to the poster grid when the detail modal closes so the D-pad
+    // isn't stranded on a dismissed overlay. Scoped to VOD/SERIES so IPTV focus
+    // handling is untouched.
+    LaunchedEffect(vodModalItem) {
+        if (vodModalItem == null && contentType != ContentType.IPTV && filteredContent.isNotEmpty()) {
+            delay(60)
+            runCatching { listFocusRequester.requestFocus() }
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Image(
+            painter            = painterResource(id = R.drawable.tvbackground),
+            contentDescription = null,
+            modifier           = Modifier.fillMaxSize(),
+            contentScale       = ContentScale.Crop
+        )
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+
+        Row(modifier = Modifier.fillMaxSize()) {
+
+            // ── LEFT SIDEBAR ──────────────────────────────────────────────
+            Column(
+                modifier = Modifier
+                    .width(72.dp)
+                    .fillMaxHeight()
+                    .background(Color.Black.copy(alpha = 0.4f))
+                    .padding(vertical = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.SpaceEvenly
+            ) {
+                Surface(
+                    onClick = { onNavigate(TvHomeComposeFragment()) },
+                    shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(10.dp)),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor        = Color.Transparent,
+                        focusedContainerColor = Color.White.copy(alpha = 0.1f)
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        border        = Border(BorderStroke(0.dp, Color.Transparent)),
+                        focusedBorder = Border(BorderStroke(1.5.dp, Color.White.copy(alpha = 0.4f)), shape = RoundedCornerShape(10.dp))
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+                ) {
+                    Image(
+                        painter = painterResource(id = R.drawable.sqlogo),
+                        contentDescription = "Home",
+                        modifier = Modifier.size(48.dp).padding(6.dp)
+                    )
+                }
+                SidebarButton(R.drawable.ic_iptv,     stringResource(R.string.home_menu_iptv))     { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.IPTV)) }
+                SidebarButton(R.drawable.ic_movies,   stringResource(R.string.home_menu_movies))   { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.VOD)) }
+                SidebarButton(R.drawable.ic_series,   stringResource(R.string.home_menu_series))   { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.SERIES)) }
+                SidebarButton(R.drawable.ic_search,   stringResource(R.string.home_menu_search))   { onNavigate(GlobalSearchFragment()) }
+                SidebarButton(R.drawable.ic_settings, stringResource(R.string.home_menu_settings)) { onNavigate(SettingsTvComposeFragment()) }
+            }
+
+            // ── MAIN CONTENT ──────────────────────────────────────────────
+            Column(modifier = Modifier.weight(1f).fillMaxHeight().padding(start = 32.dp, end = 32.dp, top = 16.dp, bottom = 24.dp)) {
+
+                // Title row
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        if (categoryPrefix.isNotEmpty()) {
+                            Text(
+                                text       = categoryPrefix,
+                                fontSize   = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color      = categoryAccent,
+                                modifier   = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(categoryAccent.copy(alpha = 0.15f))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                        Text(
+                            text          = if (categoryPrefix.isNotEmpty()) categoryDisplayName else categoryName,
+                            fontSize      = 28.sp,
+                            fontWeight    = FontWeight.Bold,
+                            color         = Color.White,
+                            letterSpacing = 0.5.sp
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .width(120.dp)
+                            .height(2.dp)
+                            .background(
+                                Brush.horizontalGradient(listOf(Color.Transparent, categoryAccent.copy(alpha = 0.6f))),
+                                RoundedCornerShape(1.dp)
+                            )
+                    )
+                }
+
+                if (contentType == ContentType.IPTV) {
+                    // IPTV keeps its two-pane layout: channel list (left) + live
+                    // MiniPlayer / EPG preview (right). Unchanged.
+                    Row(Modifier.fillMaxSize()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .weight(0.35f)
+                        ) {
+                            SearchBar(
+                                searchQuery          = searchQuery,
+                                onSearchQueryChanged = { searchQuery = it; onSearchQueryChanged?.invoke(it) },
+                                onFocusChanged       = { searchFocused = it },
+                                accentColor          = categoryAccent
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            ContentList(
+                                contentType        = contentType,
+                                contentItems       = filteredContent,
+                                isLoading          = isLoading,
+                                loadingMessage     = loadingMessage,
+                                focusRequester     = listFocusRequester,
+                                searchFocused      = searchFocused,
+                                categoryAccent     = categoryAccent,
+                                onItemSelected     = onItemSelected,
+                                onChannelFocused   = { selectedChannel = it },
+                                onVodItemFocused   = { selectedVodItem = it },
+                                onLoadMore         = onLoadMore,
+                                favoriteChannelIds = favoriteChannelIds,
+                                onFavoriteToggle   = { toggleFav(it) },
+                                onAssignEpg        = { channelForEpgOverride = it },
+                                onVodClick         = { vodModalItem = it }
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .weight(0.65f)
+                                .padding(start = 32.dp)
+                        ) {
+                            if (selectedChannel != null) {
+                                RightPane(
+                                    channel     = selectedChannel!!,
+                                    streamUrl   = miniPlayerUrl,
+                                    epgLoading  = epgLoading,
+                                    accentColor = categoryAccent
+                                )
+                            } else {
+                                RightPanePlaceholder()
+                            }
+                        }
+                    }
+                } else {
+                    // VOD / SERIES: full-width poster grid. Details now open in a
+                    // modal (see VodInfoCard) on movie select, so there's no
+                    // inline right pane eating half the width -- that reclaimed
+                    // space is what lets the grid run 6 posters wide.
+                    Column(Modifier.fillMaxSize()) {
+                        SearchBar(
+                            searchQuery          = searchQuery,
+                            onSearchQueryChanged = { searchQuery = it; onSearchQueryChanged?.invoke(it) },
+                            onFocusChanged       = { searchFocused = it },
+                            accentColor          = categoryAccent
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        ContentList(
+                            contentType        = contentType,
+                            contentItems       = filteredContent,
+                            isLoading          = isLoading,
+                            loadingMessage     = loadingMessage,
+                            focusRequester     = listFocusRequester,
+                            searchFocused      = searchFocused,
+                            categoryAccent     = categoryAccent,
+                            onItemSelected     = onItemSelected,
+                            onChannelFocused   = { selectedChannel = it },
+                            onVodItemFocused   = { selectedVodItem = it },
+                            onLoadMore         = onLoadMore,
+                            favoriteChannelIds = favoriteChannelIds,
+                            onFavoriteToggle   = { toggleFav(it) },
+                            onAssignEpg        = { channelForEpgOverride = it },
+                            onVodClick         = { vodModalItem = it }
+                        )
+                    }
+                }
+            }  // end main Column
+        }  // end Row sidebar+content
+
+        // VOD/Series detail modal -- opened when a movie poster is selected.
+        // Series posters bypass this and drill into the episode picker (handled
+        // in the grid's onClick), so this only ever shows for movies.
+        // VodInfoCard has no BackHandler of its own -- it expects the caller to
+        // handle Back -- so we add one here, scoped to when the card is open.
+        BackHandler(enabled = vodModalItem != null) { vodModalItem = null }
+        vodModalItem?.let { modalItem ->
+            VodInfoCard(
+                item             = modalItem,
+                isFavorite       = modalItem.id in favoriteVodIds,
+                onToggleFavorite = { toggleVodFav(modalItem) },  // toggles + refreshes state; card stays open
+                onPlay           = { onItemSelected(modalItem); vodModalItem = null },
+                onBack           = { vodModalItem = null }
+            )
+        }
+
+        // EPG override picker (Phase 2) -- opened from a channel's 3-dot menu.
+        channelForEpgOverride?.let { ch ->
+            val pid = activePortal?.id
+            if (pid == null) {
+                channelForEpgOverride = null
+            } else {
+                val overrideRepo = remember(pid) { com.kam.magplayer.epg.EpgOverrideRepository(context) }
+                val currentKey = remember(ch.id, pid) { overrideRepo.getOverride(pid, ch.id) }
+                EpgChannelPickerDialog(
+                    channelName = ch.name,
+                    allKeys     = remember { EpgRepository.xmlTvKeys() },
+                    currentKey  = currentKey,
+                    onSelect    = { key ->
+                        if (key == null) {
+                            overrideRepo.clearOverride(pid, ch.id)
+                            EpgRepository.clearOverride(ch.id)
+                        } else {
+                            overrideRepo.setOverride(pid, ch.id, key)
+                            EpgRepository.setOverride(ch.id, key)
+                        }
+                        channelForEpgOverride = null
+                    },
+                    onDismiss   = { channelForEpgOverride = null }
+                )
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Search bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun SearchBar(
+    searchQuery:          String,
+    onSearchQueryChanged: (String) -> Unit,
+    onFocusChanged:       (Boolean) -> Unit,
+    accentColor:          Color = Color(0xFF3B82F6)
+) {
+    var searchFocused by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.Black.copy(alpha = 0.5f))
+            .border(
+                width = if (searchFocused) 2.dp else 1.dp,
+                color = if (searchFocused) accentColor else Color.White.copy(alpha = 0.15f),
+                shape = RoundedCornerShape(8.dp)
+            )
+    ) {
+        TextField(
+            value         = searchQuery,
+            onValueChange = onSearchQueryChanged,
+            placeholder   = {
+                Text(stringResource(id = R.string.search_label), color = Color.White.copy(alpha = 0.4f))
+            },
+            modifier   = Modifier
+                .fillMaxWidth()
+                .onFocusChanged {
+                    searchFocused = it.isFocused
+                    onFocusChanged(it.isFocused)
+                },
+            singleLine = true,
+            textStyle  = TextStyle(color = Color.White, fontSize = 15.sp, letterSpacing = 0.3.sp),
+            colors     = TextFieldDefaults.colors(
+                focusedContainerColor   = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+                disabledContainerColor  = Color.Transparent,
+                focusedIndicatorColor   = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+                disabledIndicatorColor  = Color.Transparent,
+                cursorColor             = accentColor
+            )
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Placeholder
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun RightPanePlaceholder() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.Black.copy(alpha = 0.5f))
+            .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            stringResource(id = R.string.select_item_details),
+            color      = Color(0xFF64748B),
+            fontSize   = 16.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Right pane
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun RightPane(
+    channel:     Channel,
+    streamUrl:   String?,
+    epgLoading:  Boolean = false,
+    accentColor: Color   = Color(0xFF3B82F6)
+) {
+    val formatter    = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    val xmltvVersion by EpgRepository.xmltvVersion.collectAsState()
+    val stalkerVersion by EpgRepository.stalkerEpgVersion.collectAsState()
+
+    var epgEvents by remember { mutableStateOf<Pair<com.kam.magplayer.epg.StalkerEpgEvent?, com.kam.magplayer.epg.StalkerEpgEvent?>>(null to null) }
+    LaunchedEffect(channel.id, xmltvVersion, stalkerVersion) {
+        val result = withContext(Dispatchers.Default) {
+            EpgRepository.getBestEpg(channel)
+        }
+        epgEvents = result
+    }
+    val (nowEvent, nextEvent) = epgEvents
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.Black.copy(alpha = 0.5f))
+            .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+            .padding(16.dp)
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color.Black)
+        ) {
+            key(channel.id) {
+                MiniPlayer(streamUrl = streamUrl, modifier = Modifier.fillMaxSize())
+            }
+
+            if (nowEvent != null) {
+                val nowSec   = System.currentTimeMillis() / 1000
+                val progress = ((nowSec - nowEvent.start).toFloat() /
+                        (nowEvent.end - nowEvent.start).toFloat()).coerceIn(0f, 1f)
+                val timeRange = "${formatter.format(Date(nowEvent.start * 1000))} – " +
+                        formatter.format(Date(nowEvent.end * 1000))
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomStart)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+                            )
+                        )
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text       = nowEvent.title,
+                            color      = Color.White,
+                            fontSize   = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines   = 1,
+                            overflow   = TextOverflow.Ellipsis,
+                            modifier   = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(text = timeRange, color = accentColor, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    LinearProgressIndicator(
+                        progress   = { progress },
+                        modifier   = Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)),
+                        color      = accentColor,
+                        trackColor = Color.White.copy(alpha = 0.2f)
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        if (nowEvent != null && nowEvent.description.isNotBlank()) {
+            Text(text = nowEvent.description, color = Color(0xFFAAAAAA), fontSize = 12.sp,
+                maxLines = 3, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(8.dp))
+        }
+
+        if (nextEvent != null) {
+            Text(text = "Next: ${nextEvent.title}", color = Color(0xFF94A3B8), fontSize = 12.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(text = formatter.format(Date(nextEvent.start * 1000)), color = accentColor, fontSize = 11.sp)
+        }
+
+        if (nowEvent == null) {
+            if (epgLoading) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(12.dp), color = Color(0xFF64748B), strokeWidth = 1.5.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(text = "Loading guide…", color = Color(0xFF64748B), fontSize = 12.sp)
+                }
+            } else {
+                Text(text = stringResource(id = R.string.no_program_information), color = Color(0xFF64748B), fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOD details pane (kept for reference / possible reuse; no longer shown inline
+// for VOD/SERIES now that selection opens VodInfoCard).
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun VodDetailsPane(item: VodItem, accentColor: Color = Color(0xFF3B82F6)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.Black.copy(alpha = 0.5f))
+            .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp)
+    ) {
+        Text(text = item.name, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+        Spacer(modifier = Modifier.height(6.dp))
+        Box(modifier = Modifier.width(80.dp).height(2.dp).background(accentColor.copy(alpha = 0.7f), RoundedCornerShape(1.dp)))
+        if (!item.year.isNullOrBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text(text = item.year, color = accentColor, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(text = item.description, color = Color(0xFF94A3B8), fontSize = 14.sp)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content list dispatcher
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ContentList(
+    contentType:       ContentType,
+    contentItems:      List<Any>,
+    isLoading:         Boolean,
+    loadingMessage:    String,
+    focusRequester:    FocusRequester,
+    searchFocused:     Boolean,
+    categoryAccent:    Color,
+    onItemSelected:    (Any) -> Unit,
+    onChannelFocused:  (Channel) -> Unit,
+    onVodItemFocused:  (VodItem) -> Unit,
+    onLoadMore:        () -> Unit,
+    favoriteChannelIds: Set<String> = emptySet(),
+    onFavoriteToggle:  (Channel) -> Unit = {},
+    onAssignEpg:       (Channel) -> Unit = {},
+    onVodClick:        (VodItem) -> Unit = {}
+) {
+    when {
+        isLoading && contentItems.isEmpty() -> {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Color.White, strokeWidth = 3.dp, modifier = Modifier.size(48.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
+                    Text(text = loadingMessage, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+        }
+
+        contentItems.isNotEmpty() -> {
+            LaunchedEffect(contentItems, isLoading, searchFocused) {
+                if (!isLoading && !searchFocused && contentItems.isNotEmpty()) {
+                    yield()
+                    when (val first = contentItems.first()) {
+                        is Channel -> onChannelFocused(first)
+                        is VodItem -> onVodItemFocused(first)
+                    }
+                    focusRequester.requestFocus()
+                }
+            }
+
+            when (contentType) {
+                ContentType.IPTV -> {
+                    val listState = rememberLazyListState()
+                    // Prefetch trigger as an event stream, not a composition
+                    // side effect. snapshotFlow only emits when the last
+                    // visible index actually changes, so this can't burst-fire
+                    // on recomposition the way the old inline check could.
+                    LaunchedEffect(listState, contentItems.size) {
+                        snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+                            .collect { lastVisible ->
+                                if (lastVisible >= contentItems.size - 5) onLoadMore()
+                            }
+                    }
+                    LazyColumn(
+                        state                 = listState,
+                        modifier              = Modifier.fillMaxSize().focusRequester(focusRequester),
+                        contentPadding        = PaddingValues(top = 12.dp, bottom = 32.dp),
+                        verticalArrangement   = Arrangement.spacedBy(4.dp)
+                    ) {
+                        itemsIndexed(
+                            contentItems,
+                            key = { index, item ->
+                                val id = when (item) { is Channel -> item.id; is VodItem -> item.id; else -> index.toString() }
+                                "${index}_$id"
+                            }
+                        ) { index, item ->
+                            if (item is Channel) {
+                                ChannelListItem(
+                                    channel        = item,
+                                    onClick        = { onItemSelected(item) },
+                                    onFocus        = { onChannelFocused(item) },
+                                    categoryAccent = categoryAccent,
+                                    isFavorite     = item.id in favoriteChannelIds,
+                                    onLongClick    = { onFavoriteToggle(item) },
+                                    onAssignEpg    = onAssignEpg
+                                )
+                            }
+                        }
+                    }
+                }
+
+                ContentType.VOD, ContentType.SERIES -> {
+                    val gridState      = rememberLazyGridState()
+                    val coroutineScope = rememberCoroutineScope()
+                    // Keyed on contentItems: after a search/filter change the
+                    // row indices shift, and a stale lastFocusedRow could
+                    // suppress the scroll-into-view for the first focus.
+                    var lastFocusedRow by remember(contentItems) { mutableStateOf(-1) }
+
+                    LaunchedEffect(gridState, contentItems.size) {
+                        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+                            .collect { lastVisible ->
+                                if (lastVisible >= contentItems.size - (POSTER_GRID_COLUMNS * 2)) onLoadMore()
+                            }
+                    }
+
+                    LazyVerticalGrid(
+                        columns               = GridCells.Fixed(POSTER_GRID_COLUMNS),
+                        state                 = gridState,
+                        modifier              = Modifier.fillMaxSize().focusRequester(focusRequester)
+                            .focusProperties { canFocus = false },
+                        contentPadding        = PaddingValues(top = 12.dp, bottom = 32.dp, start = 8.dp, end = 8.dp),
+                        verticalArrangement   = Arrangement.spacedBy(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        itemsIndexed(
+                            contentItems,
+                            key = { index, item ->
+                                val id = when (item) { is VodItem -> item.id; is Channel -> item.id; else -> index.toString() }
+                                "${index}_$id"
+                            }
+                        ) { index, item ->
+                            if (item is VodItem) {
+                                val currentRow = index / POSTER_GRID_COLUMNS
+                                PosterCard(
+                                    item        = item,
+                                    accentColor = categoryAccent,
+                                    onClick     = {
+                                        // Movies open the detail modal; series keep
+                                        // drilling into the episode picker (handled
+                                        // by onItemSelected -> handleItemSelection).
+                                        if (item.isSeries) onItemSelected(item)
+                                        else onVodClick(item)
+                                    },
+                                    onFocus     = {
+                                        onVodItemFocused(item)
+                                        if (currentRow != lastFocusedRow) {
+                                            lastFocusedRow = currentRow
+                                            coroutineScope.launch {
+                                                gridState.animateScrollToItem(index = currentRow * POSTER_GRID_COLUMNS, scrollOffset = 0)
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        else -> {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No content", color = Color(0xFF64748B), fontSize = 16.sp)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Channel list item — D-pad RIGHT moves to ★ button, OK toggles favourite
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun ChannelListItem(
+    channel:        Channel,
+    onClick:        () -> Unit,
+    onFocus:        () -> Unit,
+    categoryAccent: Color = Color(0xFF3B82F6),
+    isFavorite:     Boolean = false,
+    onLongClick:    () -> Unit = {},
+    onAssignEpg:    (Channel) -> Unit = {}
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    var starFocused by remember { mutableStateOf(false) }
+    var menuFocused by remember { mutableStateOf(false) }
+
+    val channelAccent = remember(channel.name) {
+        val prefix = contentExtractPrefix(channel.name)
+        if (prefix.isNotEmpty()) contentRegionColors[prefix] ?: categoryAccent else categoryAccent
+    }
+    val (prefix, displayName) = remember(channel.name) { contentStripPrefix(channel.name) }
+
+    val rowFocused = isFocused || starFocused || menuFocused
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (rowFocused) Color.Black.copy(alpha = 0.7f) else Color.Black.copy(alpha = 0.5f))
+            .border(
+                width = if (rowFocused) 2.dp else 1.dp,
+                color = if (rowFocused) channelAccent else Color.White.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(6.dp)
+            ),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.width(3.dp).fillMaxHeight()
+            .background(if (rowFocused) channelAccent else channelAccent.copy(alpha = 0.4f)))
+
+        Surface(
+            onClick = onClick,
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .onFocusChanged { if (it.isFocused) onFocus() },
+            interactionSource = interactionSource,
+            shape  = ClickableSurfaceDefaults.shape(RoundedCornerShape(0.dp)),
+            scale  = ClickableSurfaceDefaults.scale(focusedScale = 1.0f, pressedScale = 0.98f),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor        = Color.Transparent,
+                focusedContainerColor = Color.Transparent
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border        = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(BorderStroke(0.dp, Color.Transparent))
+            )
+        ) {
+            Row(
+                modifier = Modifier.fillMaxSize().padding(start = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ChannelLogo(
+                    channel = channel,
+                    accent = channelAccent,
+                    modifier = Modifier.size(28.dp).clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                if (prefix.isNotEmpty()) {
+                    Text(
+                        text       = prefix,
+                        fontSize   = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color      = channelAccent,
+                        modifier   = Modifier
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(channelAccent.copy(alpha = 0.12f))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Text(
+                    text       = if (prefix.isNotEmpty()) displayName else channel.name,
+                    modifier   = Modifier.weight(1f),
+                    fontSize   = 14.sp,
+                    fontWeight = if (rowFocused) FontWeight.SemiBold else FontWeight.Normal,
+                    color      = if (rowFocused) Color.White else Color(0xFFCBD5E1),
+                    maxLines   = 1,
+                    overflow   = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        // ★ Favourite button — D-pad RIGHT from channel focuses this, OK toggles
+        Surface(
+            onClick = onLongClick,
+            modifier = Modifier
+                .width(44.dp)
+                .fillMaxHeight()
+                .onFocusChanged { starFocused = it.isFocused },
+            shape  = ClickableSurfaceDefaults.shape(RoundedCornerShape(topEnd = 6.dp, bottomEnd = 6.dp)),
+            scale  = ClickableSurfaceDefaults.scale(focusedScale = 1.0f),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor        = Color.Transparent,
+                focusedContainerColor = Color(0xFFFBBF24).copy(alpha = 0.15f)
+            ),
+            border = ClickableSurfaceDefaults.border(
+                border        = Border(BorderStroke(0.dp, Color.Transparent)),
+                focusedBorder = Border(BorderStroke(0.dp, Color.Transparent))
+            )
+        ) {
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                Text(
+                    text     = if (isFavorite) "★" else "☆",
+                    fontSize = 16.sp,
+                    color    = when {
+                        isFavorite  -> Color(0xFFFBBF24)
+                        starFocused -> Color(0xFFFBBF24).copy(alpha = 0.8f)
+                        rowFocused  -> Color.White.copy(alpha = 0.4f)
+                        else        -> Color.White.copy(alpha = 0.15f)
+                    }
+                )
+            }
+        }
+
+        // 3-dot menu -- "EPG override" assigns this channel a guide source.
+        RowActionMenu(
+            items = listOf(
+                RowAction(
+                    label = "EPG override",
+                    onClick = { onAssignEpg(channel) }
+                )
+            ),
+            onFocusChange = { menuFocused = it },
+            cornerEnd = 6.dp,
+            tint = channelAccent
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOD poster card
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun PosterCard(
+    item:        VodItem,
+    onClick:     () -> Unit,
+    onFocus:     () -> Unit,
+    accentColor: Color = Color(0xFF3B82F6)
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+
+    val scale by animateFloatAsState(
+        targetValue = if (isFocused) 1.03f else 1f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "poster_scale"
+    )
+
+    Card(
+        onClick           = onClick,
+        interactionSource = interactionSource,
+        modifier          = Modifier
+            .padding(3.dp)
+            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .onFocusChanged { if (it.isFocused) onFocus() },
+        shape  = CardDefaults.shape(RoundedCornerShape(12.dp)),
+        colors = CardDefaults.colors(
+            containerColor        = Color.Black.copy(alpha = 0.5f),
+            focusedContainerColor = Color.Black.copy(alpha = 0.5f)
+        ),
+        border = CardDefaults.border(
+            border        = Border(border = BorderStroke(1.dp, Color.Transparent), shape = RoundedCornerShape(12.dp)),
+            focusedBorder = Border(border = BorderStroke(2.dp, accentColor),       shape = RoundedCornerShape(12.dp))
+        ),
+        scale  = CardDefaults.scale(focusedScale = 1.0f, pressedScale = 0.98f)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier            = Modifier.padding(8.dp)
+        ) {
+            AsyncImage(
+                model = coil.request.ImageRequest.Builder(LocalContext.current)
+                    .data(item.poster)
+                    .size(300, 450)
+                    .allowHardware(DeviceInfo.allowHardwareBitmaps)
+                    .build(),
+                contentDescription = item.name,
+                placeholder        = ColorPainter(Color(0xFF808080).copy(alpha = 0.3f)),
+                error              = ColorPainter(Color(0xFF808080).copy(alpha = 0.3f)),
+                modifier           = Modifier.aspectRatio(2f / 3f).fillMaxWidth().clip(RoundedCornerShape(8.dp)),
+                contentScale       = ContentScale.Crop
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text       = item.name,
+                fontSize   = 12.sp,
+                color      = if (isFocused) Color.White else Color(0xFFCBD5E1),
+                fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines   = 2,
+                overflow   = TextOverflow.Ellipsis,
+                textAlign  = TextAlign.Center
+            )
+        }
+    }
+}
