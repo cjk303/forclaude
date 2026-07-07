@@ -1,0 +1,929 @@
+package com.kam.magplayer
+
+import android.content.Intent
+import android.os.Bundle
+import android.util.Log
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.tv.material3.*
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.yield
+
+class GlobalSearchFragment : Fragment() {
+
+    private var savedQuery: String = ""
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View = ComposeView(requireContext()).apply {
+        setContent {
+            MaterialTheme {
+                GlobalSearchScreen(
+                    initialQuery       = savedQuery,
+                    onQueryChanged     = { savedQuery = it },
+                    onChannelSelected  = { channel, portal -> launchChannel(channel, portal) },
+                    onVodSelected      = { vod, portal     -> launchVod(vod, portal) },
+                    onBack             = { requireActivity().finish() },
+                    onNavigate         = { frag -> tvGoTopLevel(frag) }
+                )
+            }
+        }
+    }
+
+    private fun launchChannel(channel: Channel, portal: Portal) {
+        val cache = PortalCache.get(portal.id)
+        val catId = channel.category.ifBlank { "0" }
+
+        // Find the index of the selected channel within its category's cached list.
+        val channelsInCategory = cache.channelPagesByGenre[catId]?.values?.flatten() ?: emptyList()
+        val index = channelsInCategory.indexOfFirst { it.id == channel.id }
+
+        val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+            putExtra("PORTAL_URL",  portal.portalUrl)
+            putExtra("MAC_ADDRESS", portal.macAddress)
+            putExtra("PORTAL_ID",   portal.id)
+            if (portal.isXtream) {
+                putExtra("IS_XTREAM",       true)
+                putExtra("XTREAM_USERNAME", portal.username)
+                putExtra("XTREAM_PASSWORD", portal.password)
+            }
+
+            // FIX: Pass the correct category and index so PlayerActivity plays the selected channel
+            putExtra("CATEGORY_ID",   catId)
+            putExtra("CATEGORY_NAME", cache.genres.find { it.id == catId }?.title ?: "")
+            putExtra("CURRENT_INDEX", if (index != -1) index else 0)
+            putExtra("CONTENT_TYPE",  ContentType.IPTV.name)
+
+            // Pass the full lists so navigation/overlay works correctly in the player
+            val catIds = ArrayList(cache.genres.map { it.id })
+            val catNames = ArrayList(cache.genres.map { it.title })
+            putStringArrayListExtra("CAT_IDS",   catIds)
+            putStringArrayListExtra("CAT_NAMES", catNames)
+        }
+        startActivity(intent)
+    }
+
+    private fun launchVod(vod: VodItem, portal: Portal) {
+        if (portal.isM3U || portal.isXtream) {
+            if (vod.isSeries) {
+                tvGoDrillDown(SeriesBrowseFragment.newInstance(vod))
+            } else {
+                val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+                    putExtra("VIDEO_URL",   vod.cmd)
+                    putExtra("VIDEO_ID",    vod.id)
+                    putExtra("TITLE",       vod.name)
+                    putExtra("PORTAL_URL",  portal.effectiveUrl)
+                    putExtra("MAC_ADDRESS", portal.macAddress)
+                }
+                startActivity(intent)
+            }
+        } else {
+            if (vod.isSeries) {
+                val fragment = SeriesBrowseFragment.newInstance(vod)
+                parentFragmentManager.beginTransaction()
+                    .replace(R.id.tv_fragment_container, fragment)
+                    .addToBackStack(null).commit()
+            } else {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val vodClient = VodClient(portal.effectiveUrl, portal.macAddress)
+                        val vodFile   = vodClient.getVodFile(vod)
+                        withContext(Dispatchers.Main) {
+                            val intent = Intent(requireContext(), PlayerActivity::class.java).apply {
+                                putExtra("VIDEO_URL",   vodFile.cmd)
+                                putExtra("VIDEO_ID",    vod.id)
+                                putExtra("TITLE",       vod.name)
+                                putExtra("PORTAL_URL",  portal.effectiveUrl)
+                                putExtra("MAC_ADDRESS", portal.macAddress)
+                            }
+                            startActivity(intent)
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(requireContext(),
+                                getString(R.string.error_resolve_stream, e.message),
+                                android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Data ──────────────────────────────────────────────────────────────────────
+
+internal data class SearchResults(
+    val channels: List<Channel> = emptyList(),
+    val vod:      List<VodItem> = emptyList(),
+    val series:   List<VodItem> = emptyList(),
+    // False when part of the search plan failed or was cancelled --
+    // such results must not be cached as authoritative.
+    val complete: Boolean = true
+) {
+    val isEmpty get() = channels.isEmpty() && vod.isEmpty() && series.isEmpty()
+    val total   get() = channels.size + vod.size + series.size
+}
+
+private val M3U_GROUP_TITLE_REGEX = Regex("""group-title="([^"]*)"""", RegexOption.IGNORE_CASE)
+private val M3U_TVG_LOGO_REGEX    = Regex("""tvg-logo="([^"]*)"""",    RegexOption.IGNORE_CASE)
+private val M3U_TVG_ID_REGEX      = Regex("""tvg-id="([^"]*)"""",      RegexOption.IGNORE_CASE)
+
+internal object SearchCache {
+    private const val MAX_ENTRIES = 50
+    private val map = object : LinkedHashMap<String, SearchResults>(MAX_ENTRIES, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SearchResults>) =
+            size > MAX_ENTRIES
+    }
+    fun key(portalId: String, query: String) = "$portalId|${query.trim().lowercase()}"
+    fun get(portalId: String, query: String): SearchResults? =
+        synchronized(this) { map[key(portalId, query)] }
+    fun put(portalId: String, query: String, results: SearchResults) {
+        if (!results.isEmpty && results.complete)
+            synchronized(this) { map[key(portalId, query)] = results }
+    }
+    fun clearPortal(portalId: String) {
+        synchronized(this) { map.keys.removeAll { it.startsWith("$portalId|") } }
+    }
+}
+
+// ── Screen ────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun GlobalSearchScreen(
+    initialQuery:      String = "",
+    onQueryChanged:    (String) -> Unit = {},
+    onChannelSelected: (Channel, Portal) -> Unit,
+    onVodSelected:     (VodItem, Portal) -> Unit,
+    onBack:            () -> Unit,
+    onNavigate:        (androidx.fragment.app.Fragment) -> Unit = {}
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope   = rememberCoroutineScope()
+
+    var query            by remember { mutableStateOf(initialQuery) }
+    var results          by remember { mutableStateOf(SearchResults()) }
+    var isSearching      by remember { mutableStateOf(false) }
+    var portal           by remember { mutableStateOf<Portal?>(null) }
+    var searchJob        by remember { mutableStateOf<Job?>(null) }
+    var progressText     by remember { mutableStateOf("") }
+    var progressFraction by remember { mutableStateOf(0f) }
+    var fromCache        by remember { mutableStateOf(false) }
+
+    val searchFocusRequester = remember { FocusRequester() }
+    var searchBarFocused by remember { mutableStateOf(false) }
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val isTV = configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_TYPE_MASK ==
+            android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+
+    if (!isTV) {
+        BackHandler { onBack() }
+    }
+
+    LaunchedEffect(Unit) {
+        val loaded = withContext(Dispatchers.IO) {
+            val repo = PortalRepository(context)
+            repo.getActivePortal()
+        }
+        if (portal != null && portal?.id != loaded?.id) {
+            portal?.id?.let { SearchCache.clearPortal(it) }
+        }
+        portal = loaded
+        try { searchFocusRequester.requestFocus() } catch (_: Exception) {}
+    }
+
+    LaunchedEffect(query, portal) {
+        val p = portal ?: return@LaunchedEffect
+        if (query.length < 2) {
+            results = SearchResults(); isSearching = false
+            progressText = ""; progressFraction = 0f
+            return@LaunchedEffect
+        }
+        searchJob?.cancel()
+        isSearching = true; progressText = ""; progressFraction = 0f
+        fromCache = false; results = SearchResults()
+        delay(400)
+        searchJob = scope.launch(Dispatchers.IO) {
+            performSearchWithProgress(
+                query = query, portal = p, context = context,
+                onProgress = { text, fraction -> progressText = text; progressFraction = fraction },
+                onPartialResult = { partial -> if (!partial.isEmpty) results = partial }
+            ).also { final ->
+                withContext(Dispatchers.Main) {
+                    results = final; isSearching = false
+                    progressText = ""; progressFraction = 0f
+                }
+            }
+        }
+    }
+
+    if (isTV) {
+        // ── TV: background + sidebar + main content ───────────────────────────
+        Box(Modifier.fillMaxSize()) {
+            Image(painter = painterResource(R.drawable.tvbackground), contentDescription = null,
+                modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+
+            Row(modifier = Modifier.fillMaxSize()) {
+                // Sidebar
+                Column(
+                    modifier = Modifier.width(72.dp).fillMaxHeight()
+                        .background(Color.Black.copy(alpha = 0.4f)).padding(vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.SpaceEvenly
+
+                ) {
+                    Surface(
+                        onClick = { onNavigate(TvHomeComposeFragment()) },
+                        shape  = ClickableSurfaceDefaults.shape(RoundedCornerShape(10.dp)),
+                        colors = ClickableSurfaceDefaults.colors(containerColor = Color.Transparent, focusedContainerColor = Color.White.copy(alpha = 0.1f)),
+                        border = ClickableSurfaceDefaults.border(border = Border(BorderStroke(0.dp, Color.Transparent)), focusedBorder = Border(BorderStroke(1.5.dp, Color.White.copy(alpha = 0.4f)), shape = RoundedCornerShape(10.dp))),
+                        scale  = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+                    ) {
+                        Image(painter = painterResource(R.drawable.sqlogo), contentDescription = stringResource(R.string.home_menu_home),
+                            modifier = Modifier.size(48.dp).padding(6.dp))
+                    }
+                    SidebarButton(R.drawable.ic_iptv,     stringResource(R.string.home_menu_iptv))     { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.IPTV)) }
+                    SidebarButton(R.drawable.ic_movies,   stringResource(R.string.home_menu_movies))   { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.VOD)) }
+                    SidebarButton(R.drawable.ic_series,   stringResource(R.string.home_menu_series))   { onNavigate(CategoryBrowseComposeFragment.newInstance(ContentType.SERIES)) }
+                    SidebarButton(R.drawable.ic_search,   stringResource(R.string.home_menu_search))   { /* already here */ }
+                    SidebarButton(R.drawable.ic_settings, stringResource(R.string.home_menu_settings)) { onNavigate(SettingsTvComposeFragment()) }
+                }
+
+                // Main content
+                Column(
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                        .padding(start = 32.dp, end = 32.dp, top = 16.dp, bottom = 24.dp)
+                ) {
+                    // Title row
+                    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(stringResource(R.string.search_title), color = Color.White,
+                            fontSize = 28.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+                        Box(modifier = Modifier.width(120.dp).height(2.dp).background(
+                            Brush.horizontalGradient(listOf(Color.Transparent, Color(0xFF3B82F6).copy(alpha = 0.6f))),
+                            RoundedCornerShape(1.dp)))
+                    }
+
+                    // Search bar
+                    SearchBar(query = query, onQueryChange = { query = it; onQueryChanged(it) },
+                        focusRequester = searchFocusRequester, isFocused = searchBarFocused,
+                        onFocusChanged = { searchBarFocused = it })
+
+                    Spacer(Modifier.height(20.dp))
+
+                    // Results — TV shows logos
+                    SearchResultsArea(
+                        query = query, isSearching = isSearching, results = results,
+                        progressText = progressText, progressFraction = progressFraction,
+                        fromCache = fromCache, portal = portal, searchJob = searchJob,
+                        onChannelSelected = onChannelSelected, onVodSelected = onVodSelected,
+                        showLogos = true
+                    )
+                }
+            }
+        }
+    } else {
+        // ── Phone: simple column, no sidebar, no logos ────────────────────────
+        Box(Modifier.fillMaxSize().background(Color(0xFF0A0A0F))) {
+            Column(Modifier.fillMaxSize().systemBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 16.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.size(36.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.Black.copy(alpha = 0.4f))
+                            .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
+                            .clickable(onClick = onBack),
+                        contentAlignment = Alignment.Center
+                    ) { Text("←", color = Color.White, fontSize = 16.sp) }
+                    Text(stringResource(R.string.search_title), color = Color.White,
+                        fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                SearchBar(query = query, onQueryChange = { query = it; onQueryChanged(it) },
+                    focusRequester = searchFocusRequester, isFocused = searchBarFocused,
+                    onFocusChanged = { searchBarFocused = it })
+
+                Spacer(Modifier.height(16.dp))
+
+                // Results — phone has NO logos
+                SearchResultsArea(
+                    query = query, isSearching = isSearching, results = results,
+                    progressText = progressText, progressFraction = progressFraction,
+                    fromCache = fromCache, portal = portal, searchJob = searchJob,
+                    onChannelSelected = onChannelSelected, onVodSelected = onVodSelected,
+                    showLogos = false
+                )
+            }
+        }
+    }
+}
+
+// ── Shared composables ────────────────────────────────────────────────────────
+
+@Composable
+private fun SearchBar(
+    query: String, onQueryChange: (String) -> Unit,
+    focusRequester: FocusRequester, isFocused: Boolean, onFocusChanged: (Boolean) -> Unit
+) {
+    Box(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            .background(Color.Black.copy(alpha = 0.6f))
+            .border(width = if (isFocused) 2.dp else 1.dp,
+                color = if (isFocused) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.2f),
+                shape = RoundedCornerShape(10.dp))
+    ) {
+        TextField(
+            value = query, onValueChange = onQueryChange,
+            placeholder = { Text(stringResource(R.string.search_hint), color = Color.White.copy(alpha = 0.4f)) },
+            modifier = Modifier.fillMaxWidth().focusRequester(focusRequester)
+                .onFocusChanged { onFocusChanged(it.isFocused) },
+            singleLine = true,
+            textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
+                cursorColor = Color(0xFF3B82F6)
+            )
+        )
+    }
+}
+
+@Composable
+private fun SearchResultsArea(
+    query: String, isSearching: Boolean, results: SearchResults,
+    progressText: String, progressFraction: Float,
+    fromCache: Boolean, portal: Portal?, searchJob: Job?,
+    onChannelSelected: (Channel, Portal) -> Unit,
+    onVodSelected: (VodItem, Portal) -> Unit,
+    showLogos: Boolean
+) {
+    when {
+        query.length < 2 -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(stringResource(R.string.search_min_chars), color = Color(0xFF64748B), fontSize = 16.sp)
+            }
+        }
+        isSearching && results.isEmpty -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.clip(RoundedCornerShape(16.dp))
+                        .background(Color.Black.copy(alpha = 0.6f))
+                        .padding(horizontal = 40.dp, vertical = 32.dp)
+                ) {
+                    LinearProgressIndicator(
+                        progress = { progressFraction },
+                        modifier = Modifier.width(300.dp).height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = Color(0xFF3B82F6), trackColor = Color.White.copy(alpha = 0.15f)
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Text(progressText.ifBlank { stringResource(R.string.search_loading_progress) },
+                        color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                    Spacer(Modifier.height(20.dp))
+                    androidx.compose.material3.TextButton(
+                        onClick = { searchJob?.cancel(); }
+                    ) { Text(stringResource(R.string.search_stop), color = Color(0xFF3B82F6), fontSize = 14.sp) }
+                }
+            }
+        }
+        else -> {
+            if (!results.isEmpty && portal != null) {
+                val p = portal
+                Column {
+                    if (fromCache && !isSearching) {
+                        Text(stringResource(R.string.search_cached_results, results.total),
+                            color = Color(0xFF3B82F6).copy(alpha = 0.7f), fontSize = 12.sp,
+                            modifier = Modifier.padding(bottom = 6.dp))
+                    }
+                    if (isSearching) {
+                        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                            .background(Color.Black.copy(alpha = 0.5f))
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            LinearProgressIndicator(progress = { progressFraction },
+                                modifier = Modifier.weight(1f).height(4.dp).clip(RoundedCornerShape(2.dp)),
+                                color = Color(0xFF3B82F6), trackColor = Color.White.copy(alpha = 0.15f))
+                            Text(progressText, color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
+                            androidx.compose.material3.TextButton(onClick = { searchJob?.cancel() }) {
+                                Text(stringResource(R.string.search_stop), color = Color(0xFF3B82F6), fontSize = 12.sp)
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
+                    if (showLogos) {
+                        // TV — horizontal rows with cards (logo + name)
+                        SearchResultsList(results = results, portal = p,
+                            onChannelSelected = onChannelSelected, onVodSelected = onVodSelected)
+                    } else {
+                        // Phone — vertical list, text only, no logos.
+                        // Keys are namespaced per section ("ch_"/"vod_"/"ser_")
+                        // because channels, vod and series share this single
+                        // LazyColumn -- a channel id can equal a movie id, and
+                        // results stream in (onPartialResult rewrites the list
+                        // mid-scroll), so position-based or bare-id keys can
+                        // collide during a measure pass and throw the
+                        // SubcomposeLayout IllegalArgumentException.
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp),
+                            contentPadding = PaddingValues(bottom = 40.dp)
+                        ) {
+                            if (results.channels.isNotEmpty()) {
+                                item { SearchSectionHeader(stringResource(R.string.search_channels_header, results.channels.size), Color(0xFF3B82F6)) }
+                                items(results.channels, key = { "ch_" + it.id }) { ch ->
+                                    PhoneResultRow(name = ch.name, onClick = { onChannelSelected(ch, p) })
+                                }
+                            }
+                            if (results.vod.isNotEmpty()) {
+                                item { SearchSectionHeader(stringResource(R.string.search_movies_header, results.vod.size), Color(0xFFF57C00)) }
+                                items(results.vod, key = { "vod_" + it.id }) { v ->
+                                    PhoneResultRow(name = v.name, subtitle = v.year.takeIf { !it.isNullOrBlank() }, onClick = { onVodSelected(v, p) })
+                                }
+                            }
+                            if (results.series.isNotEmpty()) {
+                                item { SearchSectionHeader(stringResource(R.string.search_series_header, results.series.size), Color(0xFF4CAF50)) }
+                                items(results.series, key = { "ser_" + it.id }) { s ->
+                                    PhoneResultRow(name = s.name, onClick = { onVodSelected(s, p) })
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (!isSearching) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(stringResource(R.string.search_no_results, query),
+                        color = Color(0xFF64748B), fontSize = 16.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchSectionHeader(title: String, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
+    ) {
+        Box(Modifier.width(3.dp).height(14.dp).background(color, RoundedCornerShape(2.dp)))
+        Spacer(Modifier.width(8.dp))
+        Text(title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun PhoneResultRow(name: String, subtitle: String? = null, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(name, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (subtitle != null) Text(subtitle, color = Color(0xFF64748B), fontSize = 12.sp)
+        }
+        Text("›", color = Color(0xFF475569), fontSize = 18.sp)
+    }
+}
+
+// ── Search logic ──────────────────────────────────────────────────────────────
+
+private suspend fun performSearchWithProgress(
+    query:           String,
+    portal:          Portal,
+    context:         android.content.Context,
+    onProgress:      suspend (text: String, fraction: Float) -> Unit,
+    onPartialResult: suspend (SearchResults) -> Unit
+): SearchResults = withContext(Dispatchers.IO) {
+    val q = query.trim().lowercase()
+    Log.d("GlobalSearch", "performSearchWithProgress: q='$q'")
+
+    SearchCache.get(portal.id, q)?.let { cached ->
+        withContext(Dispatchers.Main) { onPartialResult(cached) }
+        return@withContext cached
+    }
+
+    try {
+        val result = when {
+            portal.isXtream -> searchXtream(context, q, portal, onProgress, onPartialResult)
+            portal.isM3U    -> searchM3u(context, q, portal, onProgress, onPartialResult)
+            else            -> searchStalker(context, q, portal, onProgress, onPartialResult)
+        }
+        SearchCache.put(portal.id, q, result)
+        result
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        val cache = PortalCache.get(portal.id)
+        val partial = SearchResults(
+            channels = cache.channelPagesByGenre.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(30),
+            vod      = cache.vodPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20),
+            series   = cache.seriesPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20),
+            complete = false   // user cancelled mid-search; never pin this
+        )
+        SearchCache.put(portal.id, q, partial)
+        partial
+    } catch (e: Exception) {
+        Log.e("GlobalSearch", "Search failed", e)
+        SearchResults()
+    }
+}
+
+private suspend fun performSearch(
+    query:   String,
+    portal:  Portal,
+    context: android.content.Context
+): SearchResults = performSearchWithProgress(query, portal, context, { _, _ -> }, { _ -> })
+
+private suspend fun searchStalker(
+    context:         android.content.Context,
+    q:               String,
+    portal:          Portal,
+    onProgress:      suspend (String, Float) -> Unit,
+    onPartialResult: suspend (SearchResults) -> Unit
+): SearchResults {
+    val cache = PortalCache.get(portal.id)
+    val sc = StalkerSession.clientOrNull ?: StalkerClient(portal.portalUrl, portal.macAddress).also {
+        StalkerSession.client = it
+    }
+    sc.handshake(force = false)
+
+    val genres = if (cache.genres.isNotEmpty()) cache.genres.toList()
+    else {
+        withContext(Dispatchers.Main) { onProgress(context.getString(R.string.search_loading_categories), 0f) }
+        val loaded = sc.getGenres()
+        cache.genres.clear(); cache.genres.addAll(loaded); loaded
+    }
+// Channels are the only per-category phase now -- VOD/series use one
+    // server-side search call each (below), so no category prefetch needed.
+    val totalSteps = genres.size
+    var stepsComplete = 0
+    var coverageComplete = true
+    val matchedChannels = mutableListOf<Channel>()
+    val matchedVod      = mutableListOf<VodItem>()
+    val matchedSeries   = mutableListOf<VodItem>()
+
+    for (genreChunk in genres.chunked(5)) {
+        coroutineScope {
+            genreChunk.map { genre ->
+                async(Dispatchers.IO) {
+                    val cached = cache.channelPagesByGenre[genre.id]?.values?.flatten()
+                    if (cached != null) return@async cached
+
+                    try {
+                        val page = sc.getChannelsPage(genre.id, 1, limit = 2000)
+                        // FIX: Populate cache so PlayerActivity can find the channel index
+                        cache.getOrPutChannelPage(genre.id)[1] = page.channels
+                        if (page.totalItems > 0) cache.channelCountByGenre[genre.id] = page.totalItems
+                        page.channels
+                    } catch (_: Exception) { emptyList<Channel>() }
+                }
+            }.forEach { deferred ->
+                deferred.await().filterTo(matchedChannels) { it.name.lowercase().contains(q) }
+            }
+        }
+        stepsComplete += genreChunk.size
+        val fraction = stepsComplete.toFloat() / totalSteps
+        val pct = (fraction * 100).toInt()
+        val partialCh = matchedChannels.distinctBy { it.id }.take(30)
+        val partialVo = matchedVod.distinctBy { it.id }.take(30)
+        withContext(Dispatchers.Main) {
+            onProgress(context.getString(R.string.search_progress_channels, genreChunk.last().title, pct), fraction)
+            if (partialCh.isNotEmpty() || partialVo.isNotEmpty())
+                onPartialResult(SearchResults(channels = partialCh, vod = partialVo))
+        }
+    }
+
+// VOD + series via SERVER-SIDE search: the portal filters its entire
+    // library. The old per-category loop fetched only page 1 (~14 items)
+    // per category -- or trusted a PARTIAL browse cache as complete -- so
+    // most of the VOD library was invisible to search.
+    val vodClient = VodClient(portal.portalUrl, portal.macAddress)
+
+    yield()
+    withContext(Dispatchers.Main) {
+        onProgress(context.getString(R.string.search_loading_movies), 0.85f)
+    }
+    try {
+        matchedVod.addAll(vodClient.searchVod(q))
+    } catch (e: Exception) {
+        Log.w("GlobalSearch", "Server-side VOD search failed: ${e.message}")
+        coverageComplete = false
+    }
+    withContext(Dispatchers.Main) {
+        val pCh = matchedChannels.distinctBy { it.id }.take(30)
+        val pVo = matchedVod.distinctBy { it.id }.take(30)
+        if (pVo.isNotEmpty()) onPartialResult(SearchResults(channels = pCh, vod = pVo))
+    }
+
+    yield()
+    withContext(Dispatchers.Main) {
+        onProgress(context.getString(R.string.search_loading_series), 0.95f)
+    }
+    try {
+        matchedSeries.addAll(vodClient.searchSeries(q))
+    } catch (e: Exception) {
+        Log.w("GlobalSearch", "Server-side series search failed: ${e.message}")
+        coverageComplete = false
+    }
+
+    return SearchResults(
+        channels = matchedChannels.distinctBy { it.id }.take(30),
+        vod      = matchedVod.distinctBy { it.id }.take(30),
+        series   = matchedSeries.distinctBy { it.id }.take(20),
+        complete = coverageComplete
+    )
+}
+
+private fun buildResults(q: String, channels: List<Channel>, vod: List<VodItem>, series: List<VodItem>) =
+    SearchResults(
+        channels = channels.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(30),
+        vod      = vod.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(30),
+        series   = series.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20)
+    )
+
+private suspend fun searchXtream(
+    context:         android.content.Context,
+    q:               String,
+    portal:          Portal,
+    onProgress:      suspend (String, Float) -> Unit = { _, _ -> },
+    onPartialResult: suspend (SearchResults) -> Unit = { _ -> }
+): SearchResults {
+    val cache  = PortalCache.get(portal.id)
+    val client = XtreamClient(portal.portalUrl, portal.username, portal.password)
+
+    val cachedCh = cache.channelPagesByGenre.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(30)
+    val cachedVo = cache.vodPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20)
+    val cachedSe = cache.seriesPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20)
+    if (cachedCh.isNotEmpty() || cachedVo.isNotEmpty() || cachedSe.isNotEmpty())
+        return SearchResults(cachedCh, cachedVo, cachedSe)
+
+    withContext(Dispatchers.Main) { onProgress(context.getString(R.string.search_loading_streams), 0.2f) }
+    val channels = mutableListOf<Channel>()
+    try {
+        val cats = if (cache.genres.isNotEmpty()) cache.genres
+        else client.getLiveCategories().map { StalkerGenre(it.id, it.title, "") }.also { cache.genres.addAll(it) }
+        for (cat in cats) {
+            if (channels.size >= 30) break
+            try { val s = client.getLiveStreams(cat.id); cache.getOrPutChannelPage(cat.id)[1] = s; channels.addAll(s.filter { it.name.lowercase().contains(q) }) } catch (_: Exception) {}
+        }
+    } catch (_: Exception) {}
+
+    withContext(Dispatchers.Main) { onProgress(context.getString(R.string.search_loading_movies), 0.5f) }
+    val vod = mutableListOf<VodItem>()
+    try {
+        val cats = if (cache.vodCategories.isNotEmpty()) cache.vodCategories else client.getVodCategories().also { cache.vodCategories.addAll(it) }
+        for (cat in cats) {
+            if (vod.size >= 20) break
+            try { val i = client.getVodStreams(cat.id); cache.getOrPutVodPage(cat.id)[1] = i; vod.addAll(i.filter { it.name.lowercase().contains(q) }) } catch (_: Exception) {}
+        }
+    } catch (_: Exception) {}
+
+    withContext(Dispatchers.Main) { onProgress(context.getString(R.string.search_loading_series), 0.8f) }
+    val series = mutableListOf<VodItem>()
+    try {
+        val cats = if (cache.seriesCategories.isNotEmpty()) cache.seriesCategories else client.getSeriesCategories().also { cache.seriesCategories.addAll(it) }
+        for (cat in cats) {
+            if (series.size >= 20) break
+            try { val i = client.getSeries(cat.id); cache.getOrPutSeriesPage(cat.id)[1] = i; series.addAll(i.filter { it.name.lowercase().contains(q) }) } catch (_: Exception) {}
+        }
+    } catch (_: Exception) {}
+
+    return SearchResults(channels.take(30), vod.take(20), series.take(20))
+}
+
+private suspend fun searchM3u(
+    context:         android.content.Context,
+    q:               String,
+    portal:          Portal,
+    onProgress:      suspend (String, Float) -> Unit = { _, _ -> },
+    onPartialResult: suspend (SearchResults) -> Unit = { _ -> }
+): SearchResults {
+    val cache = PortalCache.get(portal.id)
+    val channels = cache.channelPagesByGenre.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(30)
+    val vod      = cache.vodPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20)
+    val series   = cache.seriesPagesByCategory.values.flatMap { it.values.flatten() }.distinctBy { it.id }.filter { it.name.lowercase().contains(q) }.take(20)
+    if (channels.isNotEmpty() || vod.isNotEmpty() || series.isNotEmpty())
+        return SearchResults(channels, vod, series)
+
+    withContext(Dispatchers.Main) { onProgress(context.getString(R.string.search_loading_progress), 0.3f) }
+    val rawFile = M3uCache.rawFile(context, portal.portalUrl)
+    if (rawFile.exists()) {
+        val matchedCh = mutableListOf<Channel>(); val matchedVo = mutableListOf<VodItem>(); val matchedSe = mutableListOf<VodItem>()
+        var currentName = ""; var currentGroup = ""; var currentLogo = ""; var currentId = ""
+        rawFile.bufferedReader().use { reader ->
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val t = line!!.trim()
+                when {
+                    t.startsWith("#EXTINF:") -> {
+                        currentName  = t.substringAfterLast(",").trim()
+                        currentGroup = M3U_GROUP_TITLE_REGEX.find(t)?.groupValues?.get(1)?.ifBlank { context.getString(R.string.uncategorized) } ?: context.getString(R.string.uncategorized)
+                        currentLogo  = M3U_TVG_LOGO_REGEX.find(t)?.groupValues?.get(1) ?: ""
+                        currentId    = M3U_TVG_ID_REGEX.find(t)?.groupValues?.get(1) ?: currentName
+                    }
+                    t.isNotBlank() && !t.startsWith("#") -> {
+                        if (currentName.lowercase().contains(q)) {
+                            val cmd = t
+                            when (M3uContentType.detect(currentGroup, cmd)) {
+                                ContentType.IPTV   -> if (matchedCh.size < 30) {
+                                    val ch = Channel(id=currentId, name=currentName, logo=currentLogo, category=currentGroup, cmd=cmd, epgId="", realId="")
+                                    matchedCh.add(ch)
+                                    // Ensure it's in the cache for PlayerActivity
+                                    val pageMap = cache.getOrPutChannelPage(currentGroup)
+                                    val list = pageMap[1]?.toMutableList() ?: mutableListOf()
+                                    if (list.none { it.id == ch.id }) { list.add(ch); pageMap[1] = list }
+                                }
+                                ContentType.VOD    -> if (matchedVo.size < 20) {
+                                    val v = VodItem(id=currentId, name=currentName, poster=currentLogo, description="", year="", cmd=cmd, isSeries=false, isMovie=true)
+                                    matchedVo.add(v)
+                                    val pageMap = cache.getOrPutVodPage(currentGroup)
+                                    val list = pageMap[1]?.toMutableList() ?: mutableListOf()
+                                    if (list.none { it.id == v.id }) { list.add(v); pageMap[1] = list }
+                                }
+                                ContentType.SERIES -> if (matchedSe.size < 20) {
+                                    val s = VodItem(id=currentId, name=currentName, poster=currentLogo, description="", year="", cmd=cmd, isSeries=true, isMovie=false)
+                                    matchedSe.add(s)
+                                    val pageMap = cache.getOrPutSeriesPage(currentGroup)
+                                    val list = pageMap[1]?.toMutableList() ?: mutableListOf()
+                                    if (list.none { it.id == s.id }) { list.add(s); pageMap[1] = list }
+                                }
+                            }
+                        }
+                        currentName = ""; currentGroup = ""; currentLogo = ""; currentId = ""
+                    }
+                }
+                if (matchedCh.size >= 30 && matchedVo.size >= 20 && matchedSe.size >= 20) break
+            }
+        }
+        return SearchResults(matchedCh, matchedVo, matchedSe)
+    }
+    return SearchResults()
+}
+
+// ── Results UI ────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun SearchResultsList(
+    results:           SearchResults,
+    portal:            Portal,
+    onChannelSelected: (Channel, Portal) -> Unit,
+    onVodSelected:     (VodItem, Portal) -> Unit
+) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(24.dp),
+        contentPadding = PaddingValues(bottom = 40.dp)) {
+        if (results.channels.isNotEmpty()) {
+            item { SearchSection(stringResource(R.string.search_channels_header, results.channels.size), Color(0xFF3B82F6)) }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(results.channels, key = { "ch_" + it.id }) { ch -> ChannelSearchCard(ch) { onChannelSelected(ch, portal) } }
+                }
+            }
+        }
+        if (results.vod.isNotEmpty()) {
+            item { SearchSection(stringResource(R.string.search_movies_header, results.vod.size), Color(0xFFF57C00)) }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(results.vod, key = { "vod_" + it.id }) { v -> VodSearchCard(v) { onVodSelected(v, portal) } }
+                }
+            }
+        }
+        if (results.series.isNotEmpty()) {
+            item { SearchSection(stringResource(R.string.search_series_header, results.series.size), Color(0xFF4CAF50)) }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(results.series, key = { "ser_" + it.id }) { s -> VodSearchCard(s) { onVodSelected(s, portal) } }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchSection(title: String, color: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.width(4.dp).height(20.dp).background(color, RoundedCornerShape(2.dp)))
+        Spacer(Modifier.width(10.dp))
+        Text(title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun ChannelSearchCard(channel: Channel, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    Surface(
+        onClick = onClick, interactionSource = interactionSource,
+        modifier = Modifier.width(180.dp),
+        shape  = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        colors = ClickableSurfaceDefaults.colors(containerColor = Color.Black.copy(alpha = 0.5f), focusedContainerColor = Color.Black.copy(alpha = 0.7f)),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(BorderStroke(2.dp, Color(0xFF3B82F6)), shape = RoundedCornerShape(8.dp)),
+            border        = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)), shape = RoundedCornerShape(8.dp))
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f)
+    ) {
+        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            AsyncImage(model = channel.logo, contentDescription = channel.name,
+                placeholder = painterResource(R.drawable.ic_iptv), error = painterResource(R.drawable.ic_iptv),
+                modifier = Modifier.size(36.dp).clip(CircleShape), contentScale = ContentScale.Crop)
+            Spacer(Modifier.width(10.dp))
+            Text(channel.name, color = if (isFocused) Color.White else Color(0xFFCBD5E1),
+                fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+                modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun VodSearchCard(vod: VodItem, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    val borderColor by animateColorAsState(if (isFocused) Color(0xFFF57C00) else Color.Transparent)
+    Card(
+        onClick = onClick, interactionSource = interactionSource,
+        modifier = Modifier.width(120.dp),
+        shape  = CardDefaults.shape(RoundedCornerShape(8.dp)),
+        colors = CardDefaults.colors(containerColor = Color.Black.copy(alpha = 0.5f)),
+        border = CardDefaults.border(focusedBorder = Border(BorderStroke(2.dp, borderColor), shape = RoundedCornerShape(8.dp))),
+        scale  = CardDefaults.scale(focusedScale = 1.05f)
+    ) {
+        Column {
+            AsyncImage(model = vod.poster, contentDescription = vod.name,
+                modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f)
+                    .clip(RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp)),
+                contentScale = ContentScale.Crop)
+            Text(vod.name, color = if (isFocused) Color.White else Color(0xFFCBD5E1),
+                fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                fontWeight = if (isFocused) FontWeight.SemiBold else FontWeight.Normal,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(6.dp).fillMaxWidth())
+        }
+    }
+}
