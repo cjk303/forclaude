@@ -861,9 +861,13 @@ class PlayerActivity : AppCompatActivity(), MediaPlayer.EventListener {
     }
 
     private fun buildVlcOptions(streamType: StreamType): List<String> {
+// PlayerOptimizer's contract (see its header comment): it emits ONLY
+        // --network-caching and --audio-resampler, both safe everywhere.
+        // Everything device-dangerous (hw decode, vout, aout) is decided
+        // right here, below. The old strip list is gone because there is
+        // nothing left to strip -- if the optimizer ever grows new options,
+        // review them against this block first.
         val options = playerOptimizer.buildVlcOptions(streamType).toMutableList()
-        val stripPrefixes = listOf("--avcodec-hw","--codec","--drop-late-frames","--aout","--audio-resampler","--no-stats","--vout")
-        options.removeAll { opt -> stripPrefixes.any { opt.startsWith(it) } }
         val isEmulator = android.os.Build.FINGERPRINT.contains("generic") ||
                 android.os.Build.FINGERPRINT.contains("emulator") ||
                 android.os.Build.MODEL.contains("Emulator") ||
