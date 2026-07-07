@@ -1,0 +1,242 @@
+package com.kam.magplayer
+
+import android.app.ActivityManager
+import android.content.Context
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.os.Build
+import android.util.Log
+
+enum class DevicePerformance {
+    LOW,
+    MEDIUM,
+    HIGH
+}
+
+/**
+ * Rates a device's video playback capability into LOW / MEDIUM / HIGH so
+ * PlayerOptimizer can pick caching, decoder, and resampler settings.
+ *
+ * Rating strategy, in priority order:
+ *   1. Emulator    -> always LOW (MediaCodec is unreliable on emulators)
+ *   2. Capability  -> query MediaCodecList for what this device can actually
+ *                     hardware-decode (HEVC? H.264? at what resolution?).
+ *                     This is the primary signal -- it answers the exact
+ *                     question the optimizer cares about, per device, rather
+ *                     than guessing from the brand name.
+ *   3. Brand hint  -> only used to nudge a borderline capability result up or
+ *                     down (e.g. a known-premium Shield with an oddly-reported
+ *                     codec list still gets the benefit of the doubt). Never
+ *                     the sole basis for a rating anymore.
+ *   4. RAM         -> last-resort fallback if the codec query returns nothing
+ *                     usable (some odd firmwares report an empty codec list).
+ *
+ * Why this replaces the old brand-only chain: "isSnapdragon -> HIGH" lumped a
+ * flagship and a 2014 budget chip into one bucket, and the long tail of cheap
+ * TV boxes fell through to a RAM check that barely correlates with decode
+ * power. Querying MediaCodecList fixes both -- it sees the actual decoder,
+ * including on devices we've never heard of.
+ */
+class DeviceRater(private val context: Context) {
+
+    companion object {
+        private const val TAG = "DeviceRater"
+
+        private const val MIME_HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC   // "video/hevc"
+        private const val MIME_AVC  = MediaFormat.MIMETYPE_VIDEO_AVC    // "video/avc" (H.264)
+
+        // Resolution thresholds (width in pixels).
+        private const val WIDTH_4K   = 3840
+        private const val WIDTH_1080 = 1920
+    }
+
+    /** Summary of what the device's hardware decoders can do. */
+    private data class DecodeCapability(
+        val hwHevc: Boolean,        // hardware HEVC decoder present
+        val hwHevc4k: Boolean,      // ...and it advertises >= 4K width
+        val hwAvc: Boolean,         // hardware H.264 decoder present
+        val hwAvc1080: Boolean,     // ...and it advertises >= 1080 width
+        val anyHardware: Boolean    // any non-software video decoder at all
+    )
+
+    fun rateDevice(): DevicePerformance {
+        // 1. Emulators don't support MediaCodec / OpenSL ES properly.
+        if (isEmulator()) {
+            Log.d(TAG, "Emulator detected -> LOW")
+            return DevicePerformance.LOW
+        }
+
+        // 2. Capability-based rating (primary signal).
+        val cap = queryDecodeCapability()
+        if (cap != null) {
+            val base = when {
+                // Full 4K HEVC hardware path -> top tier.
+                cap.hwHevc4k -> DevicePerformance.HIGH
+                // Hardware HEVC (sub-4K) or solid 1080 H.264 hardware -> mid.
+                cap.hwHevc || cap.hwAvc1080 -> DevicePerformance.MEDIUM
+                // Some hardware decode, but nothing strong -> mid/low boundary.
+                cap.anyHardware -> DevicePerformance.MEDIUM
+                // No usable hardware video decode -> software only -> LOW.
+                else -> DevicePerformance.LOW
+            }
+            val adjusted = applyBrandHint(base)
+            Log.d(TAG, "Capability rating: base=$base adjusted=$adjusted " +
+                    "(hevc4k=${cap.hwHevc4k} hevc=${cap.hwHevc} " +
+                    "avc1080=${cap.hwAvc1080} anyHw=${cap.anyHardware})")
+            return adjusted
+        }
+
+        // 4. Fallback: RAM-based rating (only if codec query failed entirely).
+        val ramTier = rateByRam()
+        Log.d(TAG, "Codec query unavailable -> RAM fallback -> $ramTier")
+        return ramTier
+    }
+
+    // -- Capability query ------------------------------------------------------
+
+    /**
+     * Inspects MediaCodecList for hardware video decoders. Returns null only if
+     * the query throws or yields no codec info at all (rare, odd firmwares),
+     * in which case the caller falls back to RAM.
+     */
+    private fun queryDecodeCapability(): DecodeCapability? {
+        return try {
+            val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            val infos = list.codecInfos
+            if (infos.isNullOrEmpty()) return null
+
+            var hwHevc = false
+            var hwHevc4k = false
+            var hwAvc = false
+            var hwAvc1080 = false
+            var anyHardware = false
+
+            for (info in infos) {
+                if (info.isEncoder) continue
+                if (!isHardware(info)) continue
+
+                for (type in info.supportedTypes) {
+                    val mime = type.lowercase()
+                    val isHevc = mime == MIME_HEVC
+                    val isAvc  = mime == MIME_AVC
+                    if (!isHevc && !isAvc) continue
+
+                    anyHardware = true
+
+                    val maxWidth = try {
+                        info.getCapabilitiesForType(type)
+                            .videoCapabilities
+                            ?.supportedWidths
+                            ?.upper ?: 0
+                    } catch (e: Exception) {
+                        0
+                    }
+
+                    if (isHevc) {
+                        hwHevc = true
+                        if (maxWidth >= WIDTH_4K) hwHevc4k = true
+                    }
+                    if (isAvc) {
+                        hwAvc = true
+                        if (maxWidth >= WIDTH_1080) hwAvc1080 = true
+                    }
+                }
+            }
+
+            // anyHardware can also be true for other codecs (VP9, AV1) we don't
+            // gate on; re-check generically so a device with only e.g. VP9
+            // hardware still counts as "has some hardware decode".
+            if (!anyHardware) {
+                anyHardware = infos.any { !it.isEncoder && isHardware(it) &&
+                        it.supportedTypes.any { t -> t.startsWith("video/", ignoreCase = true) } }
+            }
+
+            DecodeCapability(hwHevc, hwHevc4k, hwAvc, hwAvc1080, anyHardware)
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaCodecList query failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Whether a codec is hardware-accelerated.
+     *
+     * API 29+ exposes MediaCodecInfo.isHardwareAccelerated() directly. Below
+     * that we use the long-standing naming convention: Google's software
+     * decoders are named "OMX.google.*" or "c2.android.*", everything else is
+     * a vendor (hardware) codec. This is the documented, widely-used heuristic
+     * for pre-Android-10 devices.
+     */
+    private fun isHardware(info: MediaCodecInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return try { info.isHardwareAccelerated } catch (e: Exception) {
+                !isSoftwareByName(info.name)
+            }
+        }
+        return !isSoftwareByName(info.name)
+    }
+
+    private fun isSoftwareByName(name: String): Boolean {
+        val n = name.lowercase()
+        return n.startsWith("omx.google.") ||
+                n.startsWith("c2.android.") ||
+                n.contains(".sw.") ||
+                n.contains("software")
+    }
+
+    // -- Brand hint (tie-breaker only) -----------------------------------------
+
+    /**
+     * Nudges a capability-derived rating using known-device hints. Deliberately
+     * conservative: it can bump a device up at most one tier when we have
+     * strong prior knowledge it's premium, and never demotes below what the
+     * hardware actually reported (we trust real capability over brand).
+     */
+    private fun applyBrandHint(base: DevicePerformance): DevicePerformance {
+        // Known-premium silicon: if the codec query was pessimistic (e.g.
+        // under-reported max width on some Shield firmwares), allow a one-tier
+        // bump. These flags come from DeviceInfo's Build-string matching.
+        val premium = DeviceInfo.isShield || DeviceInfo.isAmlogic
+        if (premium && base == DevicePerformance.MEDIUM) {
+            return DevicePerformance.HIGH
+        }
+        // Everything else: trust the hardware. No brand-based demotion.
+        return base
+    }
+
+    // -- RAM fallback ----------------------------------------------------------
+
+    private fun rateByRam(): DevicePerformance {
+        return try {
+            val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memInfo = ActivityManager.MemoryInfo()
+            actManager.getMemoryInfo(memInfo)
+            val totalMemoryMb = memInfo.totalMem / (1024 * 1024)
+            when {
+                totalMemoryMb < 2048 -> DevicePerformance.LOW
+                totalMemoryMb < 4096 -> DevicePerformance.MEDIUM
+                else -> DevicePerformance.HIGH
+            }
+        } catch (e: Exception) {
+            // If even this fails, MEDIUM is the safest middle bet.
+            DevicePerformance.MEDIUM
+        }
+    }
+
+    // -- Emulator detection ----------------------------------------------------
+
+    private fun isEmulator(): Boolean {
+        return Build.FINGERPRINT.contains("generic") ||
+                Build.FINGERPRINT.contains("emulator") ||
+                Build.FINGERPRINT.contains("unknown") ||
+                Build.MODEL.contains("Emulator") ||
+                Build.MODEL.contains("Android SDK") ||
+                Build.MANUFACTURER.contains("Genymotion") ||
+                Build.BRAND.startsWith("generic") ||
+                Build.DEVICE.startsWith("generic") ||
+                Build.PRODUCT.contains("sdk") ||
+                Build.HARDWARE.contains("goldfish") ||
+                Build.HARDWARE.contains("ranchu")
+    }
+}
