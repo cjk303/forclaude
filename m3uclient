@@ -1,0 +1,344 @@
+package com.kam.magplayer
+
+import android.content.Context
+import android.util.Log
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.BufferedReader
+import java.io.IOException
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
+
+class M3uClient(private val httpClient: OkHttpClient? = null) {
+
+    companion object {
+        private const val TAG = "M3uClient"
+    }
+
+    data class LoadResult(val channels: List<Channel>)
+
+    @Throws(IOException::class)
+    fun load(url: String, context: Context): LoadResult {
+        if (url.startsWith("/")) return loadFromFile(java.io.File(url), context)
+        if (url.startsWith("content://")) return loadFromContentUri(android.net.Uri.parse(url), context)
+        if (M3uCache.isFresh(context, url)) {
+            val file = M3uCache.rawFile(context, url)
+            if (file.exists()) {
+                Log.d(TAG, "Cache fresh — parsing from disk")
+                return LoadResult(parseStream(file.inputStream()))
+            }
+        }
+        return download(url, context)
+    }
+    /**
+     * Aborts the read once [maxBytes] have been consumed. Converts the
+     * "provider returned something enormous / not a playlist" case from an
+     * OOM crash (seen in the field: OutOfMemoryError inside readLine on a
+     * 1GB box) into a caught IOException -> failed reload -> app continues
+     * on cached data.
+     */
+    private class BoundedInputStream(
+        private val delegate: java.io.InputStream,
+        private val maxBytes: Long
+    ) : java.io.InputStream() {
+        private var count = 0L
+        private fun counted(n: Int): Int {
+            if (n > 0) {
+                count += n
+                if (count > maxBytes) throw IOException(
+                    "M3U response exceeded ${maxBytes / (1024 * 1024)}MB cap")
+            }
+            return n
+        }
+        override fun read(): Int {
+            val b = delegate.read()
+            if (b >= 0) counted(1)
+            return b
+        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int =
+            counted(delegate.read(b, off, len))
+        override fun close() = delegate.close()
+    }
+    fun loadFromFile(file: java.io.File, context: Context): LoadResult {
+        Log.d(TAG, "Loading M3U from file path: ${file.absolutePath}")
+        if (!file.exists()) throw IOException("File not found: ${file.absolutePath}")
+        val cacheFile = M3uCache.rawFile(context, file.absolutePath)
+        cacheFile.parentFile?.mkdirs()
+        val channels = file.inputStream().use { input ->
+            cacheFile.outputStream().buffered().use { fileOut ->
+                parseStream(TeeOutputStream(input, fileOut))
+            }
+        }
+        Log.d(TAG, "Loaded ${channels.size} channels from file")
+        return LoadResult(channels)
+    }
+
+    fun loadFromContentUri(uri: android.net.Uri, context: Context): LoadResult {
+        Log.d(TAG, "Loading M3U from local file: $uri")
+        val cacheFile = M3uCache.rawFile(context, uri.toString())
+        cacheFile.parentFile?.mkdirs()
+        val stream = context.contentResolver.openInputStream(uri)
+            ?: throw IOException("Cannot open file: $uri")
+        val channels = stream.use { input ->
+            cacheFile.outputStream().buffered().use { fileOut ->
+                parseStream(TeeOutputStream(input, fileOut))
+            }
+        }
+        Log.d(TAG, "Loaded ${channels.size} channels from local file")
+        return LoadResult(channels)
+    }
+
+    private fun download(url: String, context: Context?): LoadResult {
+        val client = buildClient()
+        val request = buildRequest(url)
+        val channels = mutableListOf<Channel>()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+            val body = response.body ?: throw IOException("Empty response")
+
+            if (context != null) {
+                val cacheFile = M3uCache.rawFile(context, url)
+                cacheFile.parentFile?.mkdirs()
+                cacheFile.outputStream().buffered().use { fileOut ->
+                    channels.addAll(parseStream(TeeOutputStream(body.byteStream(), fileOut)))
+                }
+                Log.d(TAG, "Downloaded and cached: ${M3uCache.rawFile(context, url).length()} bytes")
+            } else {
+                channels.addAll(parseStream(body.byteStream()))
+            }
+        }
+
+        return LoadResult(channels)
+    }
+
+    @Throws(IOException::class)
+    fun loadFromUrl(url: String): List<Channel> = download(url, null).channels
+
+    @Throws(IOException::class)
+    suspend fun loadProgressive(
+        url: String,
+        context: Context,
+        firstBatchSize: Int = 30,
+        batchSize: Int = 200,
+        onBatch: suspend (channels: List<Channel>, isFirst: Boolean) -> Unit
+    ): LoadResult {
+        // Local file path (in-app file browser) — parse directly, no HTTP
+        if (url.startsWith("/")) {
+            val result = loadFromFile(java.io.File(url), context)
+            onBatch(result.channels, true)
+            return result
+        }
+        // SAF content URI (system file picker) — read via ContentResolver
+        if (url.startsWith("content://")) {
+            val result = loadFromContentUri(android.net.Uri.parse(url), context)
+            onBatch(result.channels, true)
+            return result
+        }
+        if (M3uCache.isFresh(context, url)) {
+            val file = M3uCache.rawFile(context, url)
+            if (file.exists()) {
+                Log.d(TAG, "Progressive: cache fresh — parsing from disk")
+                val allChannels = mutableListOf<Channel>()
+                parseStreamProgressive(file.inputStream(), firstBatchSize, batchSize) { batch, isFirst ->
+                    allChannels.addAll(batch)
+                    onBatch(batch, isFirst)
+                }
+                return LoadResult(allChannels)
+            }
+        }
+
+        val client = buildClient()
+        val request = buildRequest(url)
+        val allChannels = mutableListOf<Channel>()
+        val cacheFile = M3uCache.rawFile(context, url)
+        cacheFile.parentFile?.mkdirs()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+            val body = response.body ?: throw IOException("Empty response")
+            cacheFile.outputStream().buffered().use { fileOut ->
+                parseStreamProgressive(TeeOutputStream(body.byteStream(), fileOut), firstBatchSize, batchSize) { batch, isFirst ->
+                    allChannels.addAll(batch)
+                    onBatch(batch, isFirst)
+                }
+            }
+        }
+
+        Log.d(TAG, "Progressive download complete: ${cacheFile.length()} bytes, ${allChannels.size} channels")
+        return LoadResult(allChannels)
+    }
+
+    private suspend fun parseStreamProgressive(
+        stream: InputStream,
+        firstBatchSize: Int,
+        batchSize: Int,
+        onBatch: suspend (List<Channel>, Boolean) -> Unit
+    ) {
+        val pending = mutableListOf<Channel>()
+        var currentMeta: M3uMeta? = null
+        var idCounter = 0
+        var firstEmitted = false
+
+        BufferedReader(InputStreamReader(stream)).use { reader ->
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val t = line!!.trim()
+                when {
+                    t.startsWith("#EXTINF:") -> currentMeta = parseMeta(t, idCounter++)
+                    t.startsWith("#EXTGRP:") -> {
+                        val grp = t.removePrefix("#EXTGRP:").trim()
+                        if (currentMeta != null && currentMeta!!.groupTitle == "Uncategorized")
+                            currentMeta = currentMeta!!.copy(groupTitle = grp.ifBlank { "Uncategorized" })
+                    }
+                    t.isNotBlank() && !t.startsWith("#") -> {
+                        val m = currentMeta ?: M3uMeta((idCounter++).toString(), "Channel $idCounter", null, "Uncategorized", "")
+                        pending.add(Channel(id = m.id, epgId = m.tvgId.ifBlank { m.id },
+                            name = m.name, category = m.groupTitle, cmd = t, logo = m.logo))
+                        currentMeta = null
+                        val threshold = if (!firstEmitted) firstBatchSize else batchSize
+                        if (pending.size >= threshold) {
+                            onBatch(pending.toList(), !firstEmitted)
+                            firstEmitted = true
+                            pending.clear()
+                        }
+                    }
+                }
+            }
+        }
+        if (pending.isNotEmpty()) onBatch(pending.toList(), !firstEmitted)
+    }
+
+    private class TeeOutputStream(
+        private val source: InputStream,
+        private val sink: java.io.OutputStream
+    ) : InputStream() {
+        override fun read(): Int {
+            val b = source.read()
+            if (b != -1) sink.write(b)
+            return b
+        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = source.read(b, off, len)
+            if (n > 0) sink.write(b, off, n)
+            return n
+        }
+        override fun close() {
+            source.close()
+            sink.flush()
+        }
+    }
+
+    fun loadFromStream(stream: InputStream): List<Channel> = parseStream(stream)
+    fun loadFromString(content: String): List<Channel> = parseStream(content.byteInputStream())
+
+    internal fun parseStream(stream: InputStream): List<Channel> {
+        val channels = mutableListOf<Channel>()
+        var currentMeta: M3uMeta? = null
+        var idCounter = 0
+        BufferedReader(InputStreamReader(stream)).use { reader ->
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val t = line!!.trim()
+                when {
+                    t.startsWith("#EXTINF:") -> currentMeta = parseMeta(t, idCounter++)
+                    t.startsWith("#EXTGRP:") -> {
+                        val grp = t.removePrefix("#EXTGRP:").trim()
+                        if (currentMeta != null && currentMeta!!.groupTitle == "Uncategorized")
+                            currentMeta = currentMeta!!.copy(groupTitle = grp.ifBlank { "Uncategorized" })
+                    }
+                    t.isNotBlank() && !t.startsWith("#") -> {
+                        val m = currentMeta ?: M3uMeta((idCounter++).toString(), "Channel $idCounter", null, "Uncategorized", "")
+                        channels.add(Channel(id = m.id, epgId = m.tvgId.ifBlank { m.id },
+                            name = m.name, category = m.groupTitle, cmd = t, logo = m.logo))
+                        currentMeta = null
+                    }
+                }
+            }
+        }
+        return channels
+    }
+
+    private fun parseMeta(line: String, index: Int): M3uMeta {
+        val ci = line.lastIndexOf(',')
+        val name = if (ci != -1) line.substring(ci + 1).trim() else "Channel $index"
+        val ap   = if (ci != -1) line.substring(0, ci) else line
+
+        fun attr(key: String): String {
+            val prefix = "$key="
+            val i = ap.indexOf(prefix, ignoreCase = true)
+            if (i == -1) return ""
+            val vs = i + prefix.length
+            if (vs >= ap.length) return ""
+            return when (val q = ap[vs]) {
+                '"', '\'' -> { val e = ap.indexOf(q, vs + 1); if (e == -1) "" else ap.substring(vs + 1, e) }
+                else      -> { val e = ap.indexOf(' ', vs);   if (e == -1) ap.substring(vs) else ap.substring(vs, e) }
+            }
+        }
+
+        return M3uMeta(
+            index.toString(), name,
+            attr("tvg-logo").ifBlank { null },
+            attr("group-title").ifBlank { "Uncategorized" },
+            attr("tvg-id")
+        )
+    }
+
+    private fun buildClient() = httpClient ?: OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    /**
+     * Build a Request that preserves HTTP Basic Auth credentials embedded
+     * in the URL as http://username:password@host:port/path
+     *
+     * OkHttp silently strips userinfo from URLs (RFC 2396 §3.2.2 security).
+     * tvheadend and other self-hosted IPTV servers commonly use this format —
+     * without extracting credentials into an Authorization header, requests
+     * arrive unauthenticated and the server returns 401 or an empty stream.
+     *
+     * Uses regex instead of java.net.URI because URI throws on non-ASCII
+     * characters in credentials (Polish ł,ó,ą / Arabic / Cyrillic etc.)
+     * which are common in tvheadend passwords — the old URI-based approach
+     * silently fell through to the unfixed path and dropped credentials.
+     *
+     * Example URLs handled:
+     *   http://login:hasło@nazwaDDNS.duckdns.org:9987/stream/channelid/123?profile=pass
+     *   http://user:pass@server.example.com:9999/stream/channelid/456
+     */
+    private fun buildRequest(url: String): Request {
+        val builder = Request.Builder()
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Accept", "*/*")
+            .get()
+
+        // Match scheme://userinfo@rest — userinfo may contain any characters
+        // including non-ASCII (Polish, Arabic, Cyrillic) which break URI parsing
+        val credentialsRegex = Regex("""^(https?://)([^@\s]+)@(.+)$""")
+        val match = credentialsRegex.find(url)
+
+        return if (match != null) {
+            val scheme   = match.groupValues[1]  // "http://"
+            val userInfo = match.groupValues[2]  // "login:hasło"
+            val rest     = match.groupValues[3]  // "host:port/path?query"
+            val cleanUrl = "$scheme$rest"
+            // UTF-8 encoding preserves non-ASCII characters in passwords
+            val encoded = android.util.Base64.encodeToString(
+                userInfo.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+            )
+            Log.d(TAG, "Auth credentials extracted from URL for $rest")
+            builder.url(cleanUrl).header("Authorization", "Basic $encoded").build()
+        } else {
+            builder.url(url).build()
+        }
+    }
+
+    private data class M3uMeta(
+        val id: String, val name: String, val logo: String?,
+        val groupTitle: String, val tvgId: String
+    )
+}
